@@ -31,12 +31,12 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(29)   # ← fixed from 30 to 29
+) = range(29)   # FIXED: was 30, now 29
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
 PBKDF2_ITER = 1_000_000
-OTP_TTL     = 60  # seconds
+OTP_TTL     = 60
 
 # ── DB ─────────────────────────────────────────────────────
 def get_db():
@@ -73,7 +73,6 @@ def init_db():
             otp        TEXT    NOT NULL,
             expires_at INTEGER NOT NULL,
             used       INTEGER DEFAULT 0)""")
-        # Migrations for existing DBs
         for col, defval in [("tg_name","''"), ("timezone","'UTC'")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
@@ -105,7 +104,6 @@ def encrypt(secret: str, password: str, vault_id: str):
 def decrypt(ct, salt, iv, password, vault_id) -> str:
     return AESGCM(enc_key(password, vault_id, bytes(salt))).decrypt(bytes(iv), bytes(ct), None).decode()
 
-# Export uses standalone password (not vault_id-tied) so any user can import
 def export_enc_key(password: str, salt: bytes) -> bytes:
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=310_000).derive(password.encode())
 
@@ -206,7 +204,6 @@ def get_user_by_tid(tid):
         return c.execute("SELECT * FROM users WHERE telegram_id=?", (tid,)).fetchone()
 
 def find_user_by_id_or_vault(raw: str):
-    """Find user by vault_id or by telegram_id (numeric string)."""
     raw = raw.strip()
     u = get_user(raw.lower())
     if u: return u
@@ -447,7 +444,7 @@ async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         "🔓 *Password Reset*\n\n"
         "Send your *BV Vault ID* or *Telegram User ID*\\.\n"
-        "A 6\\-digit OTP will be sent to you \\(valid 60 seconds\\)\\.",
+        "A 6\\-digit OTP will be sent to the *vault owner's Telegram account* \\(valid 60 seconds\\)\\.",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return RESET_ID_INPUT
 
@@ -464,11 +461,25 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     otp = gen_otp()
     store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
-    await update.message.reply_text(
-        f"🔢 *Your reset OTP:* `{otp}`\n\n"
-        f"⏱ Valid for *60 seconds*\\.\n"
-        f"_Do not share this code with anyone\\._",
-        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    # Send OTP to the vault owner's Telegram ID (u["telegram_id"])
+    owner_tid = u["telegram_id"]
+    bot = ctx.bot
+    try:
+        await bot.send_message(
+            chat_id=owner_tid,
+            text=f"🔐 *Password Reset OTP*\n\nSomeone requested a password reset for your vault\\.\nYour one\\-time code: `{otp}`\n\n⏱ Valid for *60 seconds*\\.\n_Do not share this code with anyone_\\.",
+            parse_mode="MarkdownV2"
+        )
+        await update.message.reply_text(
+            "✅ *OTP has been sent to the vault owner's Telegram account\\!*\n\n"
+            "The owner must provide you the OTP\\. Enter it here:",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    except Exception as e:
+        logger.error(f"Failed to send OTP to owner {owner_tid}: {e}")
+        await update.message.reply_text(
+            "⚠️ *Failed to send OTP*\\. The vault owner must /start the bot first\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return RESET_ID_INPUT
     return RESET_OTP_INPUT
 
 async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -510,22 +521,17 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Passwords do not match\\.",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return RESET_NEW_PW
-    # Re-encrypt all TOTP secrets — but we don't have old password so we can't decrypt
-    # We store a flag that secrets need re-encryption on next login
-    # For security: wipe encrypted secrets (user must re-add)
     new_salt = os.urandom(16)
     with get_db() as c:
         c.execute("UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vid))
-        # TOTP secrets encrypted with old key — mark them as locked
         c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
         c.commit()
     ctx.user_data.pop("reset_vid", None); ctx.user_data.pop("reset_new_pw", None)
     ctx.user_data.pop("reset_otp_verified", None)
     await update.message.reply_text(
         "✅ *Password reset successful\\!*\n\n"
-        "⚠️ _Because TOTP secrets are encrypted with your old password, "
-        "they have been cleared for security\\. Please re\\-add your accounts\\._\n\n"
+        "⚠️ _TOTP secrets have been cleared for security\\. Please re\\-add your accounts\\._\n\n"
         "Please login with your new password\\.",
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
@@ -539,12 +545,23 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
     otp = gen_otp()
     store_otp(vault, otp)
-    await q.edit_message_text(
-        f"🔓 *Reset Password*\n\n"
-        f"🔢 Your OTP: `{otp}`\n\n"
-        f"⏱ Valid for *60 seconds*\\.\n"
-        "Enter the OTP to continue:",
-        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    # Send OTP to the logged-in user's own Telegram (they are the owner)
+    bot = ctx.bot
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=f"🔐 *Password Reset OTP*\n\nYour one\\-time code: `{otp}`\n\n⏱ Valid for *60 seconds*\\.",
+            parse_mode="MarkdownV2"
+        )
+        await q.edit_message_text(
+            "✅ *OTP sent to your Telegram account\\!*\n\nEnter the OTP here:",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    except Exception as e:
+        logger.error(f"Settings reset OTP send failed: {e}")
+        await q.edit_message_text(
+            "⚠️ *Failed to send OTP*\\. Please /start the bot again\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return TOTP_MENU
     return SETTINGS_RESET_OTP
 
 async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -629,7 +646,6 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await q.edit_message_text("⚠️ Profile not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    # Always update name from live Telegram session
     live = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
     if live: update_tg_name(vault, update.effective_user); name = live
     else: name = u["tg_name"] or "Unknown"
@@ -766,13 +782,11 @@ async def _do_save_totp(update, vault, data, pw):
     return TOTP_MENU
 
 async def _process_input(update, ctx, vault, pw):
-    """Try to process a message as QR image or otpauth or base32 secret."""
     file_obj = None
     if update.message.photo:
         file_obj = await update.message.photo[-1].get_file()
     elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image"):
         file_obj = await update.message.document.get_file()
-
     if file_obj:
         try: await update.message.delete()
         except: pass
@@ -789,13 +803,10 @@ async def _process_input(update, ctx, vault, pw):
             logger.error(f"QR: {e}")
             await update.message.reply_text("⚠️ Could not read image\\.",
                 parse_mode="MarkdownV2", reply_markup=kb_cancel())
-        return None, True  # handled (image case)
-
+        return None, True
     if not update.message.text:
         return None, False
-
     text = update.message.text.strip()
-
     if text.startswith("otpauth://"):
         try: await update.message.delete()
         except: pass
@@ -805,8 +816,6 @@ async def _process_input(update, ctx, vault, pw):
         await update.message.reply_text("⚠️ Invalid otpauth URI\\.",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return None, True
-
-    # Base32 secret auto-detect
     ok, cleaned = validate_secret(text)
     if ok and len(cleaned) >= 8:
         try:
@@ -824,8 +833,7 @@ async def _process_input(update, ctx, vault, pw):
             return None, True
         except Exception:
             pass
-
-    return None, False  # not handled
+    return None, False
 
 async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password")
@@ -1088,7 +1096,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("❌ *Wrong password or corrupted file\\.*",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
-        ctx.user_data["import_payload"] = payload  # keep for retry
+        ctx.user_data["import_payload"] = payload
         return IMPORT_PW_INPUT
     uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password","")
     imported = 0; skipped = 0
@@ -1140,12 +1148,10 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 # ── GLOBAL AUTO-DETECT ──────────────────────────────────────
 async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles messages outside of any conversation state when logged in."""
     if not update.message: return
     uid   = update.effective_user.id
     vault = get_session(uid); pw = ctx.user_data.get("password")
     if not vault or not pw: return
-    # If waiting for name after auto-detect
     if ctx.user_data.get("_global_add") and update.message.text:
         name   = update.message.text.strip()
         secret = ctx.user_data.pop("pending_secret", None)
@@ -1198,10 +1204,7 @@ def main():
     init_db()
     token = os.environ["BOT_TOKEN"]
     app   = ApplicationBuilder().token(token).build()
-
-    # Only respond in private chats
     private = filters.ChatType.PRIVATE
-
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start, filters=private)],
         states={
@@ -1266,11 +1269,9 @@ def main():
         per_chat=True,
     )
     app.add_handler(conv)
-    # Global handlers for auto-detect outside conversation
     app.add_handler(CallbackQueryHandler(global_add_cancel, pattern="^global_add_cancel$"))
     app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), global_auto_detect))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, global_auto_detect))
-
     logger.info("BlockVeil Auth Bot started.")
     app.run_polling(drop_pending_updates=True)
 
