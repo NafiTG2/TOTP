@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(30)
+) = range(29)   # ← fixed from 30 to 29
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
