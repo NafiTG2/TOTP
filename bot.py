@@ -1297,7 +1297,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── DELETE ACCOUNT (with owner notification) ────────────────
+# ── DELETE ACCOUNT (FIXED: permanent deletion with owner notification) ──────
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1327,6 +1327,9 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
+    # Store vault_id and owner_id for final confirmation
+    ctx.user_data["delete_vault"] = vault
+    ctx.user_data["delete_owner"] = u["telegram_id"]
     ctx.user_data["delete_verified"] = True
     await update.message.reply_text(
         "⚠️ *FINAL WARNING*\n\n"
@@ -1343,28 +1346,27 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Confirmation failed\\. Account not deleted\\.",
             parse_mode="MarkdownV2", reply_markup=kb_main())
         ctx.user_data.pop("delete_verified", None)
+        ctx.user_data.pop("delete_vault", None)
+        ctx.user_data.pop("delete_owner", None)
         return TOTP_MENU
+    vault = ctx.user_data.pop("delete_vault", None)
+    owner_id = ctx.user_data.pop("delete_owner", None)
     uid = update.effective_user.id
-    vault = get_session(uid)
     if not vault:
-        await update.message.reply_text("No active session.", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    # Get owner info before deletion
-    owner_id = None
-    with get_db() as c:
-        row = c.execute("SELECT telegram_id FROM users WHERE vault_id=?", (vault,)).fetchone()
-        if row:
-            owner_id = row["telegram_id"]
-    if vault and ctx.user_data.get("delete_verified"):
+        vault = get_session(uid)
+    if vault:
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM users WHERE vault_id=?", (vault,))
-            c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
+            c.execute("DELETE FROM sessions WHERE vault_id=?", (vault,))
+            c.execute("DELETE FROM login_alerts WHERE vault_id=?", (vault,))
             c.commit()
+    # Clear any session for the current user
+    clear_session(uid)
     ctx.user_data.clear()
-    # Send notification to owner if owner exists and not the current user? But owner might be the one deleting.
+    # Notify the vault owner (if known)
     if owner_id:
         try:
             bot = ctx.bot
@@ -1416,7 +1418,7 @@ async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     for k in ["pending_name","signup_pw","new_pw","edit_id","edit_name","pending_secret","_global_add",
-              "reset_vid","sreset_pw","import_payload","delete_verified"]:
+              "reset_vid","sreset_pw","import_payload","delete_verified","delete_vault","delete_owner"]:
         ctx.user_data.pop(k, None)
     uid = update.effective_user.id; vault = get_session(uid)
     if vault:
