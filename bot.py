@@ -201,8 +201,6 @@ def mark_otp_used(vault_id: str):
         c.execute("UPDATE reset_otps SET used=1 WHERE vault_id=?", (vault_id,)); c.commit()
 
 # ── Private Key ─────────────────────────────────────────────
-PRIVKEY_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*"
-
 def gen_private_key() -> str:
     raw    = secrets.token_bytes(64)
     digest = hashlib.sha3_512(raw + SERVER_KEY).digest()
@@ -1062,7 +1060,7 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"\u2705 Renamed to *{em(new_name)}*\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EXPORT ──────────────────────────────────────────────────
+# ── EXPORT VAULT (with auto-delete) ─────────────────────────
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1113,14 +1111,20 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     plain   = json.dumps({"version": 2, "vault_id": vault, "accounts": entries}, ensure_ascii=False).encode()
     payload = export_encrypt(plain, file_pw)
     bio     = BytesIO(payload); bio.name = "blockveil_backup.bvault"
-    await update.message.reply_document(
+    msg = await update.message.reply_document(
         document=bio, filename="blockveil_backup.bvault",
-        caption="🔒 *BlockVeil Encrypted Vault Backup*\n\nImport with 📥 Import Vault\\.\nShare the *file encryption password* with the importer\\.",
+        caption="🔒 *BlockVeil Encrypted Vault Backup*\n\nImport with 📥 Import Vault\\.\nShare the *file encryption password* with the importer\\.\n\n_This file will be deleted in 60 seconds_\\.",
         parse_mode="MarkdownV2")
     await update.message.reply_text("\u2705 *Vault exported\\!*", parse_mode="MarkdownV2", reply_markup=kb_main())
+    # Auto-delete after 60 seconds
+    async def delete_vault_file():
+        await asyncio.sleep(60)
+        try: await msg.delete()
+        except Exception: pass
+    asyncio.create_task(delete_vault_file())
     return TOTP_MENU
 
-# ── IMPORT ──────────────────────────────────────────────────
+# ── IMPORT VAULT ────────────────────────────────────────────
 async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1283,7 +1287,6 @@ async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     ctx.user_data.pop("pending_secret", None); ctx.user_data.pop("_global_add", None)
     await q.edit_message_text("\u274c Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
-
 
 # ── EXPORT PRIVATE KEY ───────────────────────────────────────
 async def export_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
