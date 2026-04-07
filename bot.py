@@ -1355,28 +1355,21 @@ async def gen_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg())
     return TOTP_MENU
 
-# ── LOGIN WITH PRIVATE KEY ────────────────────────────────────
+# ── LOGIN WITH PRIVATE KEY (FIXED) ────────────────────────────
 async def login_privkey_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    await q.answer()
+    # Delete original message to avoid clutter
     try:
-        await q.answer()
-        # Try to edit message, if fails send new message
-        try:
-            await q.edit_message_text(
-                "\U0001f5dd *Login with Private Key*\n\n"
-                "Send your private key as text or as the *.txt* file.",
-                parse_mode="MarkdownV2", reply_markup=kb_cancel())
-        except Exception as edit_err:
-            logger.warning(f"Could not edit message: {edit_err}")
-            await update.effective_message.reply_text(
-                "\U0001f5dd *Login with Private Key*\n\n"
-                "Send your private key as text or as the *.txt* file.",
-                parse_mode="MarkdownV2", reply_markup=kb_cancel())
-        return LOGIN_PRIVKEY_INPUT
-    except Exception as e:
-        logger.error(f"Error in login_privkey_start: {e}")
-        await update.effective_message.reply_text("⚠️ An error occurred. Please try again.")
-        return LOGIN_CHOICE
+        await q.message.delete()
+    except:
+        pass
+    # Send new message with prompt
+    await q.message.reply_text(
+        "\U0001f5dd *Login with Private Key*\n\n"
+        "Send your private key as text or as the *.txt* file.",
+        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    return LOGIN_PRIVKEY_INPUT
 
 async def login_privkey_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     privkey = None
