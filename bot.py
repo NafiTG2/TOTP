@@ -59,7 +59,14 @@ def init_db():
             password_hash BLOB    NOT NULL,
             pw_salt       BLOB    NOT NULL,
             timezone      TEXT    DEFAULT 'UTC',
+            tg_name       TEXT    DEFAULT '',
             created_at    INTEGER DEFAULT (strftime('%s','now')))""")
+        # Migrate: add tg_name column if missing
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN tg_name TEXT DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
         conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
             telegram_id INTEGER PRIMARY KEY,
             vault_id    TEXT    NOT NULL,
@@ -335,6 +342,9 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (vault_id, uid, hash_password(pw, salt), salt))
         c.commit()
     set_session(uid, vault_id)
+    tg_name = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
+    with get_db() as c:
+        c.execute("UPDATE users SET tg_name=? WHERE vault_id=?", (tg_name, vault_id)); c.commit()
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vault_id
     await update.message.reply_text(
@@ -408,6 +418,9 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_PASSWORD
     set_session(uid, vid)
+    tg_name = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
+    with get_db() as c:
+        c.execute("UPDATE users SET tg_name=? WHERE vault_id=?", (tg_name, vid)); c.commit()
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
     name = update.effective_user.first_name or "User"
@@ -996,6 +1009,226 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Choose an option:", reply_markup=kb_main())
     return TOTP_MENU
 
+
+# ── GLOBAL AUTO-DETECT (outside conversation) ─────────────
+async def global_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Catches any message when user is logged in — auto-detects QR or Base32 secret."""
+    if not update.message:
+        return
+    uid   = update.effective_user.id
+    vault = get_session(uid)
+    pw    = ctx.user_data.get("password")
+    if not vault or not pw:
+        return  # Not logged in, ignore
+
+    # ── Photo / image document ──
+    file_obj = None
+    if update.message.photo:
+        file_obj = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image"):
+        file_obj = await update.message.document.get_file()
+
+    if file_obj:
+        bio = BytesIO(); await file_obj.download_to_memory(bio); bio.seek(0)
+        try:
+            decoded = qr_decode(Image.open(bio))
+            if decoded:
+                data = parse_otpauth(decoded[0].data.decode("utf-8"))
+                if data:
+                    try: await update.message.delete()
+                    except: pass
+                    ct, salt, iv = encrypt_secret(data["secret"], pw, vault)
+                    with get_db() as c:
+                        c.execute("INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
+                            (vault, data["name"], data.get("issuer",""), ct, salt, iv)); c.commit()
+                    code, remain = totp_now(data["secret"])
+                    await update.message.reply_text(
+                        f"\u2705 *{em(data['name'])}* auto\\-added from QR\\!\n\n"
+                        f"🔢 `{code[:3]} {code[3:]}`\n"
+                        f"⏱ {bar(remain)} {remain}s\n\n"
+                        f"🔒 _Encrypted with AES\\-256\\-GCM_",
+                        parse_mode="MarkdownV2", reply_markup=kb_main())
+                    return
+        except Exception as e:
+            logger.error(f"Global QR error: {e}")
+        return  # image but no valid QR — ignore silently
+
+    # ── Text: Base32 secret ──
+    if not update.message.text:
+        return
+    text = update.message.text.strip()
+    # Skip commands and very short text
+    if text.startswith("/") or len(text) < 8:
+        return
+    ok, cleaned = validate_secret(text)
+    if ok and len(cleaned) >= 8:
+        try:
+            totp_now(cleaned)
+            try: await update.message.delete()
+            except: pass
+            ctx.user_data["pending_name_for_secret"] = cleaned
+            ctx.user_data["_global_add"] = True
+            await update.message.reply_text(
+                "✅ *Secret key detected\\!*\n\n"
+                "Enter an *account name* for this TOTP:\n"
+                "_Example: GitHub, Google, Discord_",
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="global_add_cancel")
+                ]]))
+        except Exception:
+            pass
+
+async def global_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receives account name after global secret auto-detect."""
+    if not ctx.user_data.get("_global_add"):
+        return
+    name   = update.message.text.strip()
+    secret = ctx.user_data.pop("pending_name_for_secret", None)
+    ctx.user_data.pop("_global_add", None)
+    if not name or not secret:
+        await update.message.reply_text("\u26a0\ufe0f Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        return
+    uid   = update.effective_user.id
+    vault = get_session(uid); pw = ctx.user_data.get("password")
+    if not vault or not pw:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
+        return
+    ct, salt, iv = encrypt_secret(secret, pw, vault)
+    with get_db() as c:
+        c.execute("INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
+            (vault, name, "", ct, salt, iv)); c.commit()
+    code, remain = totp_now(secret)
+    await update.message.reply_text(
+        f"✅ *{em(name)}* added\\!\n\n"
+        f"🔢 `{code[:3]} {code[3:]}`\n"
+        f"⏱ {bar(remain)} {remain}s\n\n"
+        f"🔒 _Encrypted with AES\\-256\\-GCM_",
+        parse_mode="MarkdownV2", reply_markup=kb_main())
+
+async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    ctx.user_data.pop("pending_name_for_secret", None)
+    ctx.user_data.pop("_global_add", None)
+    await q.edit_message_text("\u274c Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+
+
+# ── GLOBAL AUTO-DETECT (outside conversation) ─────────────
+async def global_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Catches any message when logged in — auto-detects QR or Base32 secret."""
+    if not update.message:
+        return
+    uid   = update.effective_user.id
+    vault = get_session(uid)
+    pw    = ctx.user_data.get("password")
+    if not vault or not pw:
+        return
+
+    # Photo / image document
+    file_obj = None
+    if update.message.photo:
+        file_obj = await update.message.photo[-1].get_file()
+    elif (update.message.document
+          and update.message.document.mime_type
+          and update.message.document.mime_type.startswith("image")):
+        file_obj = await update.message.document.get_file()
+
+    if file_obj:
+        bio = BytesIO()
+        await file_obj.download_to_memory(bio)
+        bio.seek(0)
+        try:
+            decoded = qr_decode(Image.open(bio))
+            if decoded:
+                data = parse_otpauth(decoded[0].data.decode("utf-8"))
+                if data:
+                    try: await update.message.delete()
+                    except: pass
+                    ct, salt, iv = encrypt_secret(data["secret"], pw, vault)
+                    with get_db() as c:
+                        c.execute(
+                            "INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
+                            (vault, data["name"], data.get("issuer", ""), ct, salt, iv))
+                        c.commit()
+                    code, remain = totp_now(data["secret"])
+                    issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
+                    await update.message.reply_text(
+                        f"\u2705 *{em(data['name'])}* auto\\-added from QR\\!{issuer_line}\n\n"
+                        f"\U0001f522 `{code[:3]} {code[3:]}`\n"
+                        f"\u23f1 {bar(remain)} {remain}s\n\n"
+                        f"\U0001f512 _Encrypted with AES\\-256\\-GCM_",
+                        parse_mode="MarkdownV2", reply_markup=kb_main())
+                    return
+        except Exception as e:
+            logger.error(f"Global QR error: {e}")
+        return
+
+    if not update.message.text:
+        return
+    text = update.message.text.strip()
+    if text.startswith("/") or len(text) < 8:
+        return
+
+    ok, cleaned = validate_secret(text)
+    if ok and len(cleaned) >= 8:
+        try:
+            totp_now(cleaned)
+            try: await update.message.delete()
+            except: pass
+            ctx.user_data["pending_name_for_secret"] = cleaned
+            ctx.user_data["_global_add"] = True
+            await update.message.reply_text(
+                "\u2705 *Secret key detected\\!*\n\n"
+                "Enter an *account name* for this TOTP:\n"
+                "_Example: GitHub, Google, Discord_",
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\u274c Cancel", callback_data="global_add_cancel")
+                ]]))
+        except Exception:
+            pass
+
+
+async def global_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receives account name after global secret auto-detect."""
+    if not ctx.user_data.get("_global_add"):
+        return
+    name   = update.message.text.strip()
+    secret = ctx.user_data.pop("pending_name_for_secret", None)
+    ctx.user_data.pop("_global_add", None)
+    if not name or not secret:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        return
+    uid   = update.effective_user.id
+    vault = get_session(uid)
+    pw    = ctx.user_data.get("password")
+    if not vault or not pw:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
+        return
+    ct, salt, iv = encrypt_secret(secret, pw, vault)
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
+            (vault, name, "", ct, salt, iv))
+        c.commit()
+    code, remain = totp_now(secret)
+    await update.message.reply_text(
+        f"\u2705 *{em(name)}* added\\!\n\n"
+        f"\U0001f522 `{code[:3]} {code[3:]}`\n"
+        f"\u23f1 {bar(remain)} {remain}s\n\n"
+        f"\U0001f512 _Encrypted with AES\\-256\\-GCM_",
+        parse_mode="MarkdownV2", reply_markup=kb_main())
+
+
+async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("pending_name_for_secret", None)
+    ctx.user_data.pop("_global_add", None)
+    await q.edit_message_text(
+        "\u274c Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+
 # ── MAIN ──────────────────────────────────────────────────
 def main():
     if not SERVER_KEY:
@@ -1066,6 +1299,22 @@ def main():
         per_chat=True,
     )
     app.add_handler(conv)
+
+    # Global handlers — run AFTER conv so they only catch unhandled messages
+    app.add_handler(CallbackQueryHandler(global_add_cancel, pattern="^global_add_cancel$"))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        global_add_name
+    ))
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE,
+        global_message_handler
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        global_message_handler
+    ))
+
     logger.info("BlockVeil Auth Bot started.")
     app.run_polling(drop_pending_updates=True)
 
