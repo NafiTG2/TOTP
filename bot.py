@@ -1,4 +1,4 @@
-import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string
+import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -170,7 +170,6 @@ def parse_otpauth(uri: str):
 
 # ── OTP: cryptographic hash-based, alphanumeric, unpredictable ──────────────
 def gen_otp() -> str:
-    # 32 random bytes -> SHA3-256 -> base62 -> take 8 chars
     raw    = secrets.token_bytes(32)
     digest = hashlib.sha3_256(raw + SERVER_KEY + str(time.time_ns()).encode()).hexdigest()
     b62    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -182,7 +181,6 @@ def gen_otp() -> str:
     return "".join(otp_chars)
 
 def store_otp(vault_id: str, otp: str):
-    # Store HMAC of OTP, never plaintext
     otp_hmac = hmac.new(SERVER_KEY, otp.encode(), hashlib.sha256).hexdigest()
     with get_db() as c:
         c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault_id,))
@@ -206,18 +204,14 @@ def mark_otp_used(vault_id: str):
 PRIVKEY_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*"
 
 def gen_private_key() -> str:
-    # 512-bit entropy -> SHA3-512 -> encode as readable key segments
     raw    = secrets.token_bytes(64)
     digest = hashlib.sha3_512(raw + SERVER_KEY).digest()
-    # Encode as uppercase hex groups: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx (128 hex chars = 64 bytes)
     full   = digest.hex().upper()
-    # Format as 8 groups of 8 chars separated by -
     groups = [full[i:i+8] for i in range(0, 64, 8)]
     return "-".join(groups)
 
 def store_private_key(vault_id: str, private_key: str, password: str):
     ct, salt, iv = encrypt(private_key, password, vault_id)
-    # Verifier: HMAC-SHA256(SERVER_KEY, private_key) — allows lookup without password
     verifier = hmac.new(SERVER_KEY, private_key.strip().upper().encode(), hashlib.sha256).hexdigest()
     with get_db() as c:
         c.execute("INSERT OR REPLACE INTO private_keys (vault_id,key_enc,key_salt,key_iv,key_verifier) VALUES (?,?,?,?,?)",
@@ -238,7 +232,6 @@ def has_private_key(vault_id: str) -> bool:
         return bool(c.execute("SELECT 1 FROM private_keys WHERE vault_id=?", (vault_id,)).fetchone())
 
 def find_user_by_private_key(private_key: str):
-    """Find user by private key using HMAC verifier — no password needed."""
     pk_clean  = private_key.strip().upper()
     verifier  = hmac.new(SERVER_KEY, pk_clean.encode(), hashlib.sha256).hexdigest()
     with get_db() as c:
@@ -492,7 +485,6 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await update.message.delete()
     except: pass
     uid = update.effective_user.id
-    # Support both normal login and private key login
     vid = ctx.user_data.get("login_vid") or ctx.user_data.pop("privkey_vault_id", None)
     u   = get_user(vid)
     if not u:
@@ -1228,7 +1220,6 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    # Password correct, ask for final confirmation
     ctx.user_data["delete_verified"] = True
     await update.message.reply_text(
         "⚠️ *FINAL WARNING*\n\n"
@@ -1302,7 +1293,6 @@ async def export_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     if has_private_key(vault):
-        # Already has a key — show it
         privkey = load_private_key(vault, pw)
         if not privkey:
             await q.edit_message_text("\u26a0\ufe0f Could not decrypt private key\\.",
@@ -1318,7 +1308,6 @@ async def export_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2")
         await q.edit_message_text("\u2705 Private key file sent\\. It will auto\\-delete in 60s\\.",
             parse_mode="MarkdownV2", reply_markup=kb_settings())
-        import asyncio
         async def delete_msg():
             await asyncio.sleep(60)
             try: await msg.delete()
@@ -1326,7 +1315,6 @@ async def export_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_msg())
         return TOTP_MENU
     else:
-        # No key yet — offer to generate
         await q.edit_message_text(
             "\U0001f5dd *Export Private Key*\n\n"
             "You don\'t have a private key yet\\.\n\n"
@@ -1357,7 +1345,6 @@ async def gen_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2")
     await q.edit_message_text("\u2705 *Private key generated and sent\\.*\n\nSave it securely\\. Auto\\-deletes in 60s\\.",
         parse_mode="MarkdownV2", reply_markup=kb_settings())
-    import asyncio
     async def delete_msg():
         await asyncio.sleep(60)
         try: await msg.delete()
@@ -1381,7 +1368,6 @@ async def login_privkey_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f   = await update.message.document.get_file()
         await f.download_to_memory(bio)
         raw = bio.getvalue().decode("utf-8", errors="ignore")
-        # Extract the key line between === markers
         lines = raw.splitlines()
         for i, line in enumerate(lines):
             if "=" * 10 in line and i + 1 < len(lines):
@@ -1390,7 +1376,6 @@ async def login_privkey_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     privkey = candidate; break
     elif update.message.text:
         raw = update.message.text.strip().upper().replace(" ", "")
-        # Accept with or without dashes
         nodash = raw.replace("-", "")
         if len(nodash) == 64 and all(c in "0123456789ABCDEF" for c in nodash):
             privkey = "-".join([nodash[i:i+8] for i in range(0, 64, 8)])
@@ -1411,8 +1396,6 @@ async def login_privkey_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
 
-    # Private key login: we still need password to decrypt TOTP secrets
-    # Set a temp session marker and ask for password
     ctx.user_data["privkey_vault_id"] = u["vault_id"]
     await update.message.reply_text(
         "\u2705 *Key verified\\!*\n\n"
