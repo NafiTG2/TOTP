@@ -1,4 +1,4 @@
-import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -16,11 +16,11 @@ from PIL import Image
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── States ───────────────────────────────────────────────── (32 states)
+# ── States ─────────────────────────────────────────────────
 (
     AUTH_MENU,
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
-    LOGIN_CHOICE, LOGIN_ID_INPUT, LOGIN_PASSWORD, LOGIN_IMPORT_PRIVATE_KEY,
+    LOGIN_CHOICE, LOGIN_ID_INPUT, LOGIN_PASSWORD,
     RESET_ID_INPUT, RESET_OTP_INPUT, RESET_NEW_PW, RESET_NEW_PW_CONFIRM,
     TOTP_MENU,
     ADD_WAITING, ADD_MANUAL_NAME, ADD_MANUAL_SECRET,
@@ -31,8 +31,7 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-    PRIVATE_KEY_MENU,
-) = range(32)   # fixed count
+) = range(30)   # Added DELETE_ACCOUNT_PASSWORD so now 30 states
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -74,11 +73,6 @@ def init_db():
             otp        TEXT    NOT NULL,
             expires_at INTEGER NOT NULL,
             used       INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS private_keys (
-            vault_id   TEXT PRIMARY KEY,
-            key_hash   BLOB NOT NULL,
-            key_salt   BLOB NOT NULL,
-            created_at INTEGER DEFAULT (strftime('%s','now')))""")
         for col, defval in [("tg_name","''"), ("timezone","'UTC'")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
@@ -121,37 +115,6 @@ def export_encrypt(data: bytes, password: str):
 def export_decrypt(payload: bytes, password: str) -> bytes:
     salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
     return AESGCM(export_enc_key(password, salt)).decrypt(iv, ct, None)
-
-# ── Private Key functions ──────────────────────────────────
-def generate_private_key() -> str:
-    return secrets.token_hex(32)
-
-def hash_private_key(private_key: str, salt: bytes) -> bytes:
-    return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(private_key.encode())
-
-def store_private_key(vault_id: str, private_key: str):
-    salt = os.urandom(16)
-    key_hash = hash_private_key(private_key, salt)
-    with get_db() as c:
-        c.execute("INSERT OR REPLACE INTO private_keys (vault_id, key_hash, key_salt) VALUES (?,?,?)",
-                  (vault_id, key_hash, salt))
-        c.commit()
-
-def verify_private_key(vault_id: str, private_key: str) -> bool:
-    with get_db() as c:
-        row = c.execute("SELECT key_hash, key_salt FROM private_keys WHERE vault_id=?", (vault_id,)).fetchone()
-    if not row: return False
-    computed = hash_private_key(private_key, bytes(row["key_salt"]))
-    return hmac.compare_digest(computed, bytes(row["key_hash"]))
-
-def get_vault_by_private_key(private_key: str) -> str | None:
-    with get_db() as c:
-        rows = c.execute("SELECT vault_id, key_hash, key_salt FROM private_keys").fetchall()
-    for row in rows:
-        computed = hash_private_key(private_key, bytes(row["key_salt"]))
-        if hmac.compare_digest(computed, bytes(row["key_hash"])):
-            return row["vault_id"]
-    return None
 
 # ── TOTP ───────────────────────────────────────────────────
 def clean_secret(s: str) -> str:
@@ -283,11 +246,10 @@ def parse_tz(raw: str):
 
 # ── Keyboards ───────────────────────────────────────────────
 def kb_auth():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Sign Up", callback_data="auth_signup"),
-         InlineKeyboardButton("🔑 Login",   callback_data="auth_login")],
-        [InlineKeyboardButton("📥 Import Private Key", callback_data="login_import_key")],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🆕 Sign Up", callback_data="auth_signup"),
+        InlineKeyboardButton("🔑 Login",   callback_data="auth_login"),
+    ]])
 
 def kb_main():
     return InlineKeyboardMarkup([
@@ -304,17 +266,9 @@ def kb_settings():
         [InlineKeyboardButton("🔓 Reset Password",   callback_data="settings_reset_pw")],
         [InlineKeyboardButton("📤 Export Vault",     callback_data="export_vault")],
         [InlineKeyboardButton("📥 Import Vault",     callback_data="import_vault")],
-        [InlineKeyboardButton("🔐 Export Private Key", callback_data="private_key_menu")],
         [InlineKeyboardButton("🗑 Delete Account",   callback_data="delete_account")],
         [InlineKeyboardButton("🚪 Logout",            callback_data="logout")],
         [InlineKeyboardButton("🏠 Main Menu",         callback_data="main_menu")],
-    ])
-
-def kb_private_key():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Generate New Private Key", callback_data="gen_private_key")],
-        [InlineKeyboardButton("👁️ Show My Private Key", callback_data="show_private_key")],
-        [InlineKeyboardButton("🔙 Back to Settings", callback_data="settings")],
     ])
 
 def kb_cancel():
@@ -426,54 +380,6 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]))
     return LOGIN_CHOICE
 
-async def login_import_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text(
-        "📥 *Import Private Key*\n\n"
-        "Send your *private key* (the 64-character hex string you generated).\n"
-        "_You can also send it as a text file._",
-        parse_mode="MarkdownV2", reply_markup=kb_cancel())
-    return LOGIN_IMPORT_PRIVATE_KEY
-
-async def login_import_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    private_key = None
-    if update.message.document:
-        file = await update.message.document.get_file()
-        bio = BytesIO()
-        await file.download_to_memory(bio)
-        content = bio.getvalue().decode('utf-8', errors='ignore').strip()
-        private_key = content
-    elif update.message.text:
-        private_key = update.message.text.strip()
-    try: await update.message.delete()
-    except: pass
-    if not private_key:
-        await update.message.reply_text("❌ No private key provided\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    if not re.match(r"^[a-f0-9]{64}$", private_key):
-        await update.message.reply_text("❌ Invalid private key format\\. Must be 64 hexadecimal characters\\.",
-            parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    vault_id = get_vault_by_private_key(private_key)
-    if not vault_id:
-        await update.message.reply_text("❌ Private key not recognized\\. Please check and try again\\.",
-            parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    u = get_user(vault_id)
-    if not u:
-        await update.message.reply_text("❌ Vault not found\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    set_session(update.effective_user.id, vault_id)
-    ctx.user_data["password"] = None
-    ctx.user_data["vault_id"] = vault_id
-    owner_name = u["tg_name"] if u["tg_name"] else "User"
-    await update.message.reply_text(
-        f"✅ *Logged in via private key\\!* Welcome to vault of *{em(owner_name)}*\\.\n\n"
-        "_Note: You cannot change password or export private key without knowing the account password._\n"
-        "Please change your password from Settings to set a new one\\.",
-        parse_mode="MarkdownV2", reply_markup=kb_main())
-    return TOTP_MENU
-
 async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id
@@ -536,7 +442,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── PASSWORD RESET (OTP to owner) ────────────────────────────
+# ── PASSWORD RESET (from login screen) ──────────────────────
 async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
@@ -633,7 +539,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
-# ── SETTINGS RESET (OTP to owner) ────────────────────────────
+# ── SETTINGS RESET (from settings while logged in) ──────────
 async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid)
@@ -729,14 +635,14 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
-# ── SETTINGS MENU ───────────────────────────────────────────
+# ── SETTINGS ────────────────────────────────────────────────
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text("⚙️ *Settings*\n\nChoose an option:",
         parse_mode="MarkdownV2", reply_markup=kb_settings())
     return TOTP_MENU
 
-# ── PROFILE (owner) ─────────────────────────────────────────
+# ── PROFILE (always show owner) ─────────────────────────────
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id
@@ -850,7 +756,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── ADD TOTP (unchanged) ────────────────────────────────────
+# ── ADD TOTP ────────────────────────────────────────────────
 async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1093,7 +999,7 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"\u2705 Renamed to *{em(new_name)}*\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EXPORT / IMPORT VAULT (unchanged) ───────────────────────
+# ── EXPORT ──────────────────────────────────────────────────
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1151,6 +1057,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\u2705 *Vault exported\\!*", parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
+# ── IMPORT ──────────────────────────────────────────────────
 async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1220,7 +1127,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── DELETE ACCOUNT (with password) ─────────────────────────
+# ── DELETE ACCOUNT (with password verification) ──────────────
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1237,7 +1144,8 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     pw = update.message.text.strip()
     try: await update.message.delete()
     except: pass
-    uid = update.effective_user.id; vault = get_session(uid)
+    uid = update.effective_user.id
+    vault = get_session(uid)
     if not vault:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
@@ -1249,6 +1157,7 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
+    # Password correct, ask for final confirmation
     ctx.user_data["delete_verified"] = True
     await update.message.reply_text(
         "⚠️ *FINAL WARNING*\n\n"
@@ -1272,7 +1181,6 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault,))
-            c.execute("DELETE FROM private_keys WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM users WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
             c.commit()
@@ -1281,83 +1189,6 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         "🗑 *Account permanently deleted\\.* All data has been removed\\.",
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
-
-# ── PRIVATE KEY FEATURE ────────────────────────────────────
-async def private_key_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text(
-        "🔐 *Private Key Management*\n\n"
-        "Generate a quantum\\-safe private key to log in from any device.\n"
-        "_Key is stored hashed; only you can see it when you generate/show._",
-        parse_mode="MarkdownV2", reply_markup=kb_private_key())
-    return PRIVATE_KEY_MENU
-
-async def generate_private_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = update.effective_user.id
-    vault = get_session(uid)
-    if not vault:
-        await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    private_key = generate_private_key()
-    store_private_key(vault, private_key)
-    await q.delete_message()
-    bot = ctx.bot
-    try:
-        file_bio = BytesIO(private_key.encode())
-        file_bio.name = "blockveil_private_key.txt"
-        await bot.send_document(
-            chat_id=uid,
-            document=file_bio,
-            filename="blockveil_private_key.txt",
-            caption="🔑 *Your new private key*\n\n_This message will self\\-destruct in 1 minute\\._\n"
-                    "Keep it safe. Anyone with this key can log into your vault.\n\n"
-                    "Use it on another device via 'Import Private Key' on login screen\\.",
-            parse_mode="MarkdownV2"
-        )
-        msg = await bot.send_message(
-            chat_id=uid,
-            text="⏳ *This key will disappear in 60 seconds*\\. Copy it now if needed\\.",
-            parse_mode="MarkdownV2"
-        )
-        await asyncio.sleep(60)
-        await msg.delete()
-    except Exception as e:
-        logger.error(f"Failed to send private key: {e}")
-        await bot.send_message(uid, "⚠️ Failed to send private key\\. Try again later\\.")
-    await bot.send_message(uid, "✅ Private key generated and sent\\. Returning to settings\\.",
-        reply_markup=kb_settings())
-    return TOTP_MENU
-
-async def show_private_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = update.effective_user.id
-    vault = get_session(uid)
-    if not vault:
-        await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    # Regenerate and send new key (old becomes invalid)
-    private_key = generate_private_key()
-    store_private_key(vault, private_key)
-    await q.delete_message()
-    bot = ctx.bot
-    file_bio = BytesIO(private_key.encode())
-    file_bio.name = "blockveil_private_key.txt"
-    await bot.send_document(
-        chat_id=uid,
-        document=file_bio,
-        filename="blockveil_private_key.txt",
-        caption="🔑 *Your private key (newly generated)*\n\n_This message will self\\-destruct in 1 minute\\._\n"
-                "Previous key is no longer valid\\. Keep this new key safe\\.",
-        parse_mode="MarkdownV2"
-    )
-    msg = await bot.send_message(uid, "⏳ This key will disappear in 60 seconds\\. Copy it now if needed\\.",
-        parse_mode="MarkdownV2")
-    await asyncio.sleep(60)
-    await msg.delete()
-    await bot.send_message(uid, "✅ Private key updated and sent\\. Returning to settings\\.",
-        reply_markup=kb_settings())
-    return TOTP_MENU
 
 # ── GLOBAL AUTO-DETECT ──────────────────────────────────────
 async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1424,7 +1255,6 @@ def main():
             AUTH_MENU: [
                 CallbackQueryHandler(signup_start,       pattern="^auth_signup$"),
                 CallbackQueryHandler(login_start,        pattern="^auth_login$"),
-                CallbackQueryHandler(login_import_key_start, pattern="^login_import_key$"),
             ],
             SIGNUP_PASSWORD:  [MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_pw),       CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             SIGNUP_CONFIRM:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_confirm),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
@@ -1436,7 +1266,6 @@ def main():
             ],
             LOGIN_ID_INPUT:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, login_id_input),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             LOGIN_PASSWORD:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, login_pw),        CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            LOGIN_IMPORT_PRIVATE_KEY: [MessageHandler(private & (filters.TEXT | filters.Document.ALL), login_import_key_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             RESET_ID_INPUT:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_id_input),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             RESET_OTP_INPUT:  [MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_otp_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             RESET_NEW_PW:     [MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_new_pw),    CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
@@ -1459,9 +1288,6 @@ def main():
                 CallbackQueryHandler(edit_action,          pattern="^edit_action_(rename|delete)$"),
                 CallbackQueryHandler(edit_delete_confirm,  pattern="^edit_action_delete_confirm$"),
                 CallbackQueryHandler(global_add_cancel,    pattern="^global_add_cancel$"),
-                CallbackQueryHandler(private_key_menu,     pattern="^private_key_menu$"),
-                CallbackQueryHandler(generate_private_key, pattern="^gen_private_key$"),
-                CallbackQueryHandler(show_private_key,     pattern="^show_private_key$"),
             ],
             ADD_WAITING:       [MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), handle_add_input), MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_add_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             ADD_MANUAL_NAME:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_manual_name),   CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
@@ -1482,11 +1308,6 @@ def main():
             IMPORT_FILE_WAIT: [MessageHandler(private & filters.Document.ALL, import_file_recv), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             IMPORT_PW_INPUT:  [MessageHandler(private & filters.TEXT & ~filters.COMMAND, import_pw_input),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             TZ_INPUT:         [MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_tz_input),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            PRIVATE_KEY_MENU: [
-                CallbackQueryHandler(generate_private_key, pattern="^gen_private_key$"),
-                CallbackQueryHandler(show_private_key,     pattern="^show_private_key$"),
-                CallbackQueryHandler(settings_menu,        pattern="^settings$"),
-            ],
         },
         fallbacks=[CommandHandler("start", start, filters=private)],
         allow_reentry=True,
