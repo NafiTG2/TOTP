@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
     TZ_INPUT,
     SHOW_SECRET_PW,
     SECURE_KEY_VIEW_PW,
-) = range(33)   # fixed: was 34, now 33
+) = range(33)   # fixed count
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -1746,7 +1746,7 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EDIT TOTP ────────────────────────────────────────────────
+# ── EDIT TOTP (FIXED) ───────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
@@ -1801,7 +1801,7 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
     await q.answer()
-    action = q.data.split("_")[2]
+    action = q.data.split("_")[2]  # "edit_action_rename" -> "rename"
     if action == "rename":
         await q.edit_message_text(
             "✏️ Enter *new name:*",
@@ -1809,7 +1809,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return EDIT_RENAME_INPUT
-    if action == "showsecret":
+    elif action == "showsecret":
         name = ctx.user_data.get("edit_name", "")
         await q.edit_message_text(
             f"🔍 *Show Secret Key*\n\n"
@@ -1819,13 +1819,14 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return SHOW_SECRET_PW
-    name = ctx.user_data.get("edit_name", "")
-    await q.edit_message_text(
-        f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
-    )
-    return EDIT_ACTION
+    else:  # delete
+        name = ctx.user_data.get("edit_name", "")
+        await q.edit_message_text(
+            f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
+        )
+        return EDIT_ACTION  # stay in EDIT_ACTION state for confirmation
 
 async def edit_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
@@ -1864,7 +1865,7 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return TOTP_MENU
 
-# ── SHOW SECRET KEY ─────────────────────────────────────────
+# ── SHOW SECRET KEY (for edit) ─────────────────────────────
 async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw = update.message.text.strip()
     try:
