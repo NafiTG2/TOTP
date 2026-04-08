@@ -16,7 +16,7 @@ from PIL import Image
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── States ─────────────────────────────────────────────────
+# ── States ───────────────────────────────────────────────── (37 states)
 (
     AUTH_MENU,
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
     SHOW_SECRET_PW,
     SECURE_KEY_VIEW_PW,
     SHARE_PICK,
-) = range(38)
+) = range(37)   # fixed: was 38, now 37
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -1271,8 +1271,6 @@ async def _do_save_totp(update, vault, data, pw):
         c.execute("INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv) VALUES (?,?,?,?,?,?,?,?,?)",
                   (vault, data["name"], data.get("issuer", ""), ct, salt, iv, sk_ct, sk_s, sk_iv))
         c.commit()
-    # After save, ask for type and note? Actually we can ask after save or before.
-    # For simplicity, we'll ask for type now.
     ctx.user_data["new_totp_id"] = c.lastrowid
     await update.message.reply_text(
         "✅ *Account added\\!*\n\nNow select the account type:",
@@ -1286,7 +1284,7 @@ async def _do_save_totp(update, vault, data, pw):
 
 async def set_account_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    typ = q.data.split("_")[2]  # totp/hotp/steam
+    typ = q.data.split("_")[2]
     totp_id = ctx.user_data.get("new_totp_id")
     if not totp_id:
         await q.edit_message_text("Error. Please add account again.", parse_mode="MarkdownV2", reply_markup=kb_main())
@@ -1296,7 +1294,7 @@ async def set_account_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.commit()
     await q.edit_message_text(f"✅ Account type set to *{typ.upper()}*\\. Now you can add a *note* \\(max 10 chars\\) or type `/skip`:",
                               parse_mode="MarkdownV2", reply_markup=kb_cancel())
-    return ADD_MANUAL_TYPE  # stay for note input
+    return ADD_MANUAL_TYPE
 
 async def add_note_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -1411,7 +1409,6 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── LIST TOTP (paginated, with next code) ───────────────────
 async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    # Allow page parameter from callback data
     if q.data and q.data.startswith("list_page_"):
         page = int(q.data.split("_")[2])
     else:
@@ -1599,7 +1596,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(_delete_secret_msg())
     return TOTP_MENU
 
-# ── EXPORT VAULT (with timestamp in filename) ───────────────
+# ── EXPORT VAULT (with timestamp) ───────────────────────────
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1702,7 +1699,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def import_conflict_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    choice = q.data.split("_")[1]  # overwrite or merge
+    choice = q.data.split("_")[1]
     accounts = ctx.user_data.pop("import_accounts", [])
     uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password", "")
     if not vault or not pw:
@@ -1711,7 +1708,6 @@ async def import_conflict_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     imported = 0; skipped = 0; overwritten = 0
     with get_db() as c:
         if choice == "overwrite":
-            # Delete all existing accounts first
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
         existing_names = {r["name"] for r in c.execute("SELECT name FROM totp_accounts WHERE vault_id=?", (vault,)).fetchall()} if choice == "merge" else set()
         for acc in accounts:
@@ -1724,7 +1720,7 @@ async def import_conflict_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
                 if not ok:
                     skipped += 1
                     continue
-                totp_now(secret)  # test
+                totp_now(secret)
                 ct, s, iv = encrypt(secret, pw, vault)
                 sk = load_user_secure_key(vault, pw)
                 if sk:
