@@ -1746,35 +1746,53 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EDIT TOTP (FIXED) ───────────────────────────────────────
+# ── EDIT TOTP (FIXED with error handling) ───────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q   = update.callback_query
+    q = update.callback_query
     await q.answer()
     uid = update.effective_user.id
     vault = get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-        ).fetchall()
-    if not rows:
-        await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+    try:
+        with get_db() as c:
+            rows = c.execute(
+                "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
+            ).fetchall()
+        if not rows:
+            await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+            return TOTP_MENU
+        # Build inline keyboard
+        kb = []
+        for r in rows:
+            # Escape name for MarkdownV2 in button text (button text is not parsed, but safe)
+            button_text = r["name"]
+            kb.append([InlineKeyboardButton(button_text, callback_data=f"editpick_{r['id']}")])
+        kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
+        await q.edit_message_text(
+            "✏️ *Edit TOTP* -- Select account:",
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return EDIT_PICK
+    except Exception as e:
+        logger.error(f"Edit TOTP error: {e}")
+        await q.edit_message_text(
+            f"⚠️ An error occurred: {em(str(e))}\\. Please try again later\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
         return TOTP_MENU
-    kb = [[InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")] for r in rows]
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
-    await q.edit_message_text(
-        "✏️ *Edit TOTP* -- Select account:",
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-    return EDIT_PICK
 
 async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
     await q.answer()
-    acc_id = int(q.data.split("_")[1])
+    try:
+        acc_id = int(q.data.split("_")[1])
+    except:
+        await q.answer("Invalid selection.", show_alert=True)
+        return TOTP_MENU
     uid    = update.effective_user.id
     vault  = get_session(uid)
     with get_db() as c:
@@ -1782,7 +1800,7 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "SELECT name FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault)
         ).fetchone()
     if not row:
-        await q.edit_message_text("⚠️ Not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        await q.edit_message_text("⚠️ Account not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
     ctx.user_data["edit_id"]   = acc_id
     ctx.user_data["edit_name"] = row["name"]
@@ -1801,7 +1819,11 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
     await q.answer()
-    action = q.data.split("_")[2]  # "edit_action_rename" -> "rename"
+    parts = q.data.split("_")
+    if len(parts) < 3:
+        await q.answer("Invalid action.", show_alert=True)
+        return EDIT_ACTION
+    action = parts[2]
     if action == "rename":
         await q.edit_message_text(
             "✏️ Enter *new name:*",
@@ -1826,7 +1848,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2",
             reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
         )
-        return EDIT_ACTION  # stay in EDIT_ACTION state for confirmation
+        return EDIT_ACTION  # stay in EDIT_ACTION for confirmation
 
 async def edit_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
