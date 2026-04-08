@@ -324,11 +324,22 @@ def get_freeze_remaining(vault_id: str) -> int:
             return row["frozen_until"] - int(time.time())
     return 0
 
-# ── MarkdownV2 escaping ─────────────────────────────────────
+# ── MarkdownV2 escaping (FIXED) ────────────────────────────
 def em(t) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
     if not t:
         return ""
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(t))
+    # List of special characters: _ * [ ] ( ) ~ ` > # + - = | { } . ! \
+    # We need to escape each with a backslash
+    special_chars = r"_*[]()~`>#+\-=|{}.!\\"
+    # Escape each character
+    escaped = []
+    for ch in str(t):
+        if ch in special_chars:
+            escaped.append("\\" + ch)
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
 
 def bar(r) -> str:
     f = int(r / 3)
@@ -1746,7 +1757,7 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EDIT TOTP (FIXED with error handling) ───────────────────
+# ── EDIT TOTP (FIXED) ───────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1763,12 +1774,10 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
             return TOTP_MENU
-        # Build inline keyboard
         kb = []
         for r in rows:
-            # Escape name for MarkdownV2 in button text (button text is not parsed, but safe)
-            button_text = r["name"]
-            kb.append([InlineKeyboardButton(button_text, callback_data=f"editpick_{r['id']}")])
+            # Button text does not need Markdown escaping; but we use raw name
+            kb.append([InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")])
         kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
         await q.edit_message_text(
             "✏️ *Edit TOTP* -- Select account:",
