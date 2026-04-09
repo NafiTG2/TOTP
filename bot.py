@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
     SECURE_KEY_VIEW_PW,
     SEARCH_QUERY,
     HOTP_NEXT,
-) = range(40)
+) = range(39)   # 39 states
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -49,7 +49,7 @@ ALERT_VISIBLE_HOURS = 72
 SHARE_LINK_TTL      = 600
 MAX_LOGIN_ATTEMPTS  = 5
 LOGIN_FREEZE_HOURS  = 18
-LOGIN_ATTEMPT_WINDOW = 3600  # 1 hour
+LOGIN_ATTEMPT_WINDOW = 3600
 
 # ── DB ─────────────────────────────────────────────────────
 def get_db():
@@ -2856,7 +2856,7 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Choose an option:", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── Share Codes functions (unchanged from original, included for completeness) ──
+# ── Share Codes functions ───────────────────────────────────
 async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
