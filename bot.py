@@ -393,7 +393,7 @@ def totp_now(secret: str):
     remain = 30 - (ts % 30)
     h   = hmac.new(k, struct.pack(">Q", ts // 30), hashlib.sha1).digest()
     off = h[-1] & 0xF
-    code = str(struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF % 1_000_000).zfill(6)
+    code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
     return code, remain
 
 def hotp_at(secret: str, counter: int) -> str:
@@ -402,7 +402,7 @@ def hotp_at(secret: str, counter: int) -> str:
     k = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
     h   = hmac.new(k, struct.pack(">Q", counter), hashlib.sha1).digest()
     off = h[-1] & 0xF
-    code = str(struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF % 1_000_000).zfill(6)
+    code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
     return code
 
 def steam_totp_now(secret: str):
@@ -460,7 +460,7 @@ def generate_code(account_type: str, secret: str, hotp_counter: int = 0):
         counter_next = ts // 30 + 1
         h   = hmac.new(k, struct.pack(">Q", counter_next), hashlib.sha1).digest()
         off = h[-1] & 0xF
-        next_code = str(struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF % 1_000_000).zfill(6)
+        next_code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
         return code, remain, next_code
 
 def parse_otpauth(uri: str):
