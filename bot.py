@@ -509,7 +509,7 @@ def gen_otp() -> str:
     b62    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num    = int(digest, 16)
     chars  = []
-    for _ in range(8):
+    for _ in range(10):
         chars.append(b62[num % 62])
         num //= 62
     return "".join(chars)
@@ -1030,9 +1030,18 @@ async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = update.effective_user.id
     vid = gen_vault_id(uid)
-    if not get_user(vid):
+    u   = get_user(vid)
+    if not u:
         await q.edit_message_text(
             "❌ No account found for this Telegram account\\. Please *Sign Up*\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+    # Block disabled accounts before they even enter password
+    if u["account_disabled"]:
+        await q.edit_message_text(
+            "🚫 *This account has been disabled\\.* Please contact support\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_auth(),
         )
@@ -1071,6 +1080,14 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return LOGIN_ID_INPUT
+    # Block disabled accounts before password entry
+    if u["account_disabled"]:
+        await update.message.reply_text(
+            "🚫 *This account has been disabled\\.* Please contact support\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
     ctx.user_data["login_vid"] = u["vault_id"]
     await update.message.reply_text(
         "🔒 *Enter your password:*",
@@ -1127,6 +1144,15 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text(
             "❌ Session expired\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Final safety net: block disabled accounts even if they reached password step
+    if u["account_disabled"]:
+        await update.message.reply_text(
+            "🚫 *This account has been disabled\\.* Please contact support\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_auth(),
         )
@@ -1504,20 +1530,22 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             chat_id=u["telegram_id"],
             text=(
                 f"🔐 *Password Reset OTP*\n\n"
+                f"Someone requested a password reset for your vault\\.\n\n"
                 f"Your one\\-time code:\n`{otp}`\n\n"
-                f"⏱ Valid for *60 seconds*\\."
+                f"⏱ Valid for *60 seconds*\\.\n_Do not share this with anyone\\._"
             ),
             parse_mode="MarkdownV2",
         )
         await q.edit_message_text(
-            "✅ *OTP sent\\!*\n\nEnter the OTP here:",
+            "✅ *OTP sent to your Telegram account\\!*\n\n"
+            "Enter the one\\-time code here:",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
         )
     except Exception as e:
         logger.error(f"Settings reset OTP send failed: {e}")
         await q.edit_message_text(
-            "⚠️ *Failed to send OTP\\.* The vault owner must /start the bot first\\.",
+            "⚠️ *Failed to send OTP\\.* Please try again\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
         )
@@ -3508,13 +3536,21 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/user <vault_id|telegram_id|@username>"""
     if not _is_admin_msg(update):
         return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /user <vault_id | telegram_id | @username>")
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    # Parse argument from raw message text (ctx.args drops @username in some clients)
+    raw_text = (update.message.text or "").strip()
+    parts    = raw_text.split(None, 1)   # split on first whitespace: ["/user", "arg"]
+    if len(parts) < 2 or not parts[1].strip():
+        msg = await update.message.reply_text(
+            "Usage: /user <vault_id | telegram_id | @username>"
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-    raw = " ".join(ctx.args).strip()
+    raw = parts[1].strip()
     u   = _resolve_user(raw)
     if not u:
-        await update.message.reply_text(f"❌ User not found: {raw}")
+        msg = await update.message.reply_text(f"❌ User not found: {raw}")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     info = _fmt_user_info(u)
     msg  = await update.message.reply_text(f"👤 User Info\n\n{info}")
