@@ -112,25 +112,33 @@ def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
 class _DB:
     """SQLite connection context manager that commits AND closes on exit."""
     def __init__(self):
-        self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=True)
         self._conn.row_factory = sqlite3.Row
     def __enter__(self):
         return self._conn
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
-            self._conn.commit()
+            try:
+                self._conn.commit()
+            except Exception as e:
+                logger.warning(f"DB commit failed: {e}")
         else:
             try:
                 self._conn.rollback()
             except Exception:
                 pass
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
         return False
-    # Allow using the connection directly (non-context-manager usage)
     def execute(self, *a, **kw):
         return self._conn.execute(*a, **kw)
     def close(self):
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 def get_db() -> "_DB":
     return _DB()
@@ -1531,8 +1539,20 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
 
         if sk_skipped:
+            # User skipped secure key: permanently delete ALL TOTP accounts
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
+            # Generate a brand-new secure key for this vault
+            new_secure_key = gen_secure_key()
+            # Store new secure key encrypted with new password
+            ct_sk, s_sk, iv_sk = encrypt(new_secure_key, new_pw, vid)
+            # Store new verifier
+            new_verifier = hmac.new(SERVER_KEY, new_secure_key.encode(), hashlib.sha256).hexdigest()
+            c.execute(
+                "UPDATE users SET password_hash=?, pw_salt=?, sk_enc=?, sk_salt=?, sk_iv=?, sk_verifier=? WHERE vault_id=?",
+                (hash_pw(new_pw, new_salt), new_salt, ct_sk, s_sk, iv_sk, new_verifier, vid),
+            )
+            c.commit()
         elif secure_key:
             for row in rows:
                 try:
@@ -1562,30 +1582,36 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
 
-        c.execute(
-            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-            (hash_pw(new_pw, new_salt), new_salt, vid),
-        )
-        if secure_key:
-            ct, s, iv = encrypt(secure_key, new_pw, vid)
+        # For sk_skipped path, password + new secure key already updated above.
+        # For secure_key or no-sk-at-all paths, update password now.
+        if not sk_skipped:
             c.execute(
-                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                (ct, s, iv, vid),
+                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                (hash_pw(new_pw, new_salt), new_salt, vid),
             )
-        c.commit()
+            if secure_key:
+                ct, s, iv = encrypt(secure_key, new_pw, vid)
+                c.execute(
+                    "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                    (ct, s, iv, vid),
+                )
+            c.commit()
 
     for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
               "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
 
-    # Update auto-backup stored password after reset
-    uid = update.effective_user.id
-    _oab_store_password(uid, vid, new_pw)
+    # Update auto-backup stored password after reset (use vault owner's telegram_id)
+    u_owner = get_user(vid)
+    if u_owner:
+        _oab_store_password(u_owner["telegram_id"], vid, new_pw)
 
     if sk_skipped or deleted_cnt > 0:
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
-            f"⚠️ _All {em(str(deleted_cnt))} TOTP accounts were deleted because no Secure Key was provided\\._\n\n"
+            f"⚠️ _All {em(str(deleted_cnt))} TOTP accounts were permanently deleted \\(Secure Key not provided\\)\\._\n\n"
+            "🔑 A *new Secure Key* has been generated for your vault\\.\n"
+            "You will see it after logging in via Settings → View Secure Key\\.\n\n"
             "Login with your new password\\."
         )
     elif reenc_fail > 0:
@@ -3065,15 +3091,16 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
         # For duplicate detection, decrypt existing secrets and hash them
         existing_by_name   = {r["name"]: r["id"] for r in existing_rows}  # name -> id (for replace)
         existing_secrets   = set()    # sha256(secret) set
+        # Track which entries had decrypt failures - these are protected from overwrite
+        undecryptable_names = set()
         for r in existing_rows:
             try:
                 plain = decrypt(r["secret_enc"], r["salt"], r["iv"], pw, vault)
                 existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
             except Exception as e:
-                # Decrypt failed for existing entry - log and use name-only fallback
                 logger.warning(f"Import duplicate check: decrypt failed for '{r['name']}': {e}")
-                # Mark name as existing so it won't be silently re-imported
-                existing_by_name.setdefault(r["name"], r["id"])
+                # Cannot read this entry - protect it from being overwritten
+                undecryptable_names.add(r["name"])
 
         sk = load_user_secure_key(vault, pw)
         for acc in accounts:
@@ -3094,7 +3121,10 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                 name_exists   = acc["name"] in existing_by_name
                 secret_exists = secret_hash in existing_secrets
 
-                if name_exists and secret_exists:
+                if name_exists and acc["name"] in undecryptable_names:
+                    # Existing entry could not be decrypted — never overwrite it, skip safely
+                    skipped += 1
+                elif name_exists and secret_exists:
                     # True duplicate: same name + same secret
                     if mode == "replace":
                         c.execute(
@@ -4188,12 +4218,10 @@ async def send_auto_backups(app):
         if not u:
             continue
         vault_id = u["vault_id"]
-        # Send to the currently active session (logged-in device), fallback to vault owner
-        with get_db() as c:
-            sess = c.execute(
-                "SELECT telegram_id FROM sessions WHERE vault_id=?", (vault_id,)
-            ).fetchone()
-        tid = sess["telegram_id"] if sess else owner_tid
+        # Always send to vault owner (owner_tid). The file is encrypted with the owner's
+        # password, so only they can open it. Sending to a random active session risks
+        # delivering to a device the owner may no longer use.
+        tid = owner_tid
 
         if is_weekly_window and freq == "weekly":
             if now_ts - (row["last_weekly"] or 0) < 6 * 24 * 3600:
