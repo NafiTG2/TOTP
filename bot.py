@@ -213,6 +213,12 @@ def init_db():
             except Exception:
                 pass
 
+        # Migrate users: add sk_verifier for secure key verification without password
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN sk_verifier TEXT DEFAULT ''")
+        except Exception:
+            pass
+
         for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
@@ -424,18 +430,34 @@ def load_user_secure_key(vault_id: str, password: str) -> str | None:
         return None
 
 def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
+    """Verify the Secure Key against users table sk_enc OR totp_accounts sk_enc.
+    Falls back gracefully when the user has no TOTP entries."""
+    candidate = candidate_hex.strip()
+    # Primary: try to decrypt any TOTP entry's sk_enc with the candidate
+    with get_db() as c:
+        totp_rows = c.execute(
+            "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts "
+            "WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 3",
+            (vault_id,)
+        ).fetchall()
+    for row in totp_rows:
+        try:
+            sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate, vault_id)
+            return True   # Successfully decrypted = correct key
+        except Exception:
+            continue
+    if totp_rows:
+        return False  # Had TOTP entries but none decrypted = wrong key
+    # No TOTP entries at all — verify using users.sk_enc HMAC verifier
     with get_db() as c:
         row = c.execute(
-            "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 1",
-            (vault_id,)
+            "SELECT sk_verifier FROM users WHERE vault_id=?", (vault_id,)
         ).fetchone()
-    if not row:
-        return False
-    try:
-        sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate_hex.strip(), vault_id)
-        return True
-    except Exception:
-        return False
+    if row and row["sk_verifier"]:
+        expected = hmac.new(SERVER_KEY, candidate.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(row["sk_verifier"], expected)
+    # No verifier stored (old account) and no TOTP entries: accept if format valid
+    return True
 
 # ── TOTP ───────────────────────────────────────────────────
 def clean_secret(s: str) -> str:
@@ -462,72 +484,23 @@ def totp_now(secret: str):
     code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
     return code, remain
 
-def hotp_at(secret: str, counter: int) -> str:
-    """RFC 4226 HOTP: generate code for given counter value."""
-    c = clean_secret(secret)
-    k = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
-    h   = hmac.new(k, struct.pack(">Q", counter), hashlib.sha1).digest()
+
+
+def generate_code(secret: str):
+    """
+    Generate current and next TOTP code.
+    Returns (code_str, remaining_seconds, next_code_str).
+    """
+    code, remain = totp_now(secret)
+    # Next code (next 30s window)
+    c   = clean_secret(secret)
+    k   = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
+    ts  = int(time.time())
+    counter_next = ts // 30 + 1
+    h   = hmac.new(k, struct.pack(">Q", counter_next), hashlib.sha1).digest()
     off = h[-1] & 0xF
-    code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
-    return code
-
-def steam_totp_now(secret: str):
-    """
-    Steam Guard TOTP: SHA1 HMAC with 30s period but 5-char alphanumeric output.
-    Steam uses a custom character set instead of numeric digits.
-    """
-    STEAM_CHARS = "23456789BCDFGHJKMNPQRTVWXY"
-    c  = clean_secret(secret)
-    k  = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
-    ts = int(time.time())
-    remain = 30 - (ts % 30)
-    h   = hmac.new(k, struct.pack(">Q", ts // 30), hashlib.sha1).digest()
-    off = h[19] & 0xF
-    val = struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF
-    code = ""
-    v = val
-    for _ in range(5):
-        code += STEAM_CHARS[v % len(STEAM_CHARS)]
-        v //= len(STEAM_CHARS)
-    return code, remain
-
-def generate_code(account_type: str, secret: str, hotp_counter: int = 0):
-    """
-    Universal code generator supporting TOTP, HOTP, and Steam TOTP.
-    Returns (code_str, remaining_seconds, next_code_str_or_None).
-    """
-    if account_type == "steam":
-        code, remain = steam_totp_now(secret)
-        # Next Steam code (next 30s window)
-        STEAM_CHARS = "23456789BCDFGHJKMNPQRTVWXY"
-        c  = clean_secret(secret)
-        k  = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
-        ts = int(time.time())
-        counter_next = ts // 30 + 1
-        h   = hmac.new(k, struct.pack(">Q", counter_next), hashlib.sha1).digest()
-        off = h[19] & 0xF
-        val = struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF
-        next_code = ""
-        v = val
-        for _ in range(5):
-            next_code += STEAM_CHARS[v % len(STEAM_CHARS)]
-            v //= len(STEAM_CHARS)
-        return code, remain, next_code
-    elif account_type == "hotp":
-        code = hotp_at(secret, hotp_counter)
-        next_code = hotp_at(secret, hotp_counter + 1)
-        return code, None, next_code  # HOTP has no time remaining
-    else:  # standard totp
-        code, remain = totp_now(secret)
-        # Next code (next 30s window)
-        c   = clean_secret(secret)
-        k   = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
-        ts  = int(time.time())
-        counter_next = ts // 30 + 1
-        h   = hmac.new(k, struct.pack(">Q", counter_next), hashlib.sha1).digest()
-        off = h[-1] & 0xF
-        next_code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
-        return code, remain, next_code
+    next_code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
+    return code, remain, next_code
 
 def parse_otpauth(uri: str):
     try:
@@ -546,11 +519,11 @@ def parse_otpauth(uri: str):
         ok, c = validate_secret(secret)
         if not ok:
             return None
-        # Detect Steam Guard by issuer
-        acc_type = "steam" if issuer and "steam" in issuer.lower() else otp_type
-        counter  = int(params.get("counter", ["0"])[0]) if acc_type == "hotp" else 0
+        # Only TOTP is supported
+        if otp_type != "totp":
+            return None
         return {"name": name, "issuer": issuer, "secret": c,
-                "account_type": acc_type, "hotp_counter": counter}
+                "account_type": "totp", "hotp_counter": 0}
     except Exception:
         return None
 
@@ -774,16 +747,6 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
                 (alert_id, owner_id, vault_id, msg.message_id, owner_id, now),
             )
             c.commit()
-        async def _auto_delete():
-            await asyncio.sleep(ALERT_VISIBLE_HOURS * 3600)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            with get_db() as c:
-                c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
-                c.commit()
-        asyncio.create_task(_auto_delete())
         logger.info(f"Login alert sent to owner {owner_id} for vault {vault_id}")
     except Exception as e:
         logger.error(f"Failed to send login alert to owner {owner_id}: {e}")
@@ -1015,6 +978,11 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     secure_key = gen_secure_key()
     store_user_secure_key(vid, secure_key, pw)
+    # Store HMAC verifier so secure key can be verified without password
+    sk_verifier = hmac.new(SERVER_KEY, secure_key.encode(), hashlib.sha256).hexdigest()
+    with get_db() as c:
+        c.execute("UPDATE users SET sk_verifier=? WHERE vault_id=?", (sk_verifier, vid))
+        c.commit()
 
     set_session(uid, vid)
     ctx.user_data["password"] = pw
@@ -1565,6 +1533,10 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
 
+    # Update auto-backup stored password after reset
+    uid = update.effective_user.id
+    _oab_store_password(uid, vid, new_pw)
+
     if sk_skipped or deleted_cnt > 0:
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
@@ -2064,8 +2036,6 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_WAITING
 
 async def _do_save_totp(update, vault, data, pw):
-    acc_type    = data.get("account_type", "totp")
-    hotp_ctr    = data.get("hotp_counter", 0)
     note        = (data.get("note", "") or "")[:NOTE_MAX_LEN]
     ct, salt, iv = encrypt(data["secret"], pw, vault)
     sk = load_user_secure_key(vault, pw)
@@ -2083,18 +2053,15 @@ async def _do_save_totp(update, vault, data, pw):
         c.commit()
     # Generate code for confirmation message
     try:
-        code, remain, next_code = generate_code(acc_type, data["secret"], hotp_ctr)
+        code, remain, _ = generate_code(data["secret"])
     except Exception:
-        code, remain, next_code = "------", None, None
+        code, remain = "------", 30
     issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
-    type_badge  = {"steam": "🎮 Steam", "hotp": "🔢 HOTP"}.get(acc_type, "🕐 TOTP")
-    if remain is not None:
-        time_info = f"{bar(remain)} {remain}s"
-    else:
-        time_info = f"Counter: {hotp_ctr}"
+    code_fmt    = f"{code[:3]} {code[3:]}"
+    time_info   = f"{bar(remain)} {remain}s"
     await update.message.reply_text(
-        f"✅ *{em(data['name'])}* added\\! \\({type_badge}\\){issuer_line}\n\n"
-        f"🔢 `{code}`\n"
+        f"✅ *{em(data['name'])}* added\\!{issuer_line}\n\n"
+        f"🔢 `{code_fmt}`\n"
         f"⏱ {time_info}\n\n"
         f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
         parse_mode="MarkdownV2",
@@ -2296,34 +2263,15 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
         try:
             secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
-            acc_type = row["account_type"] or "totp"
-            hotp_ctr = row["hotp_counter"] or 0
             note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(acc_type, secret, hotp_ctr)
+            code, remain, next_code = generate_code(secret)
 
-            # Format current code (TOTP: "123 456", HOTP: "123456", Steam: "ABCDE")
-            if acc_type == "steam":
-                code_fmt = code
-            elif acc_type == "hotp":
-                code_fmt = code
-            else:
-                code_fmt = f"{code[:3]} {code[3:]}"
-
-            # Timer bar and expire info
-            if remain is not None:
-                time_line  = f"{bar(remain)} {remain}s"
-            else:
-                time_line  = f"Counter: {hotp_ctr}"
+            # Format TOTP code: "123 456"
+            code_fmt  = f"{code[:3]} {code[3:]}"
+            time_line = f"{bar(remain)} {remain}s"
 
             # Next code display
-            if next_code:
-                if acc_type != "steam" and acc_type != "hotp":
-                    next_fmt = f"{next_code[:3]} {next_code[3:]}"
-                else:
-                    next_fmt = next_code
-                next_line = f"Next code: `{next_fmt}`"
-            else:
-                next_line = ""
+            next_line = f"Next code: `{next_code[:3]} {next_code[3:]}`" if next_code else ""
 
             note_line = f"Note: {em(note)}" if note else ""
 
@@ -3062,9 +3010,21 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
     skipped  = 0
     replaced = 0
     with get_db() as c:
-        existing = {r["name"]: r["id"] for r in c.execute(
-            "SELECT name, id FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()}
+        # Build duplicate lookup: {(name, secret_sha256_hex): id}
+        # This correctly handles same-name different-secret and same-secret different-name
+        existing_rows = c.execute(
+            "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+        ).fetchall()
+        # For duplicate detection, decrypt existing secrets and hash them
+        existing_by_name   = {r["name"]: r["id"] for r in existing_rows}  # name -> id (for replace)
+        existing_secrets   = set()                                           # sha256(secret) set
+        for r in existing_rows:
+            try:
+                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], pw, vault)
+                existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
+            except Exception:
+                pass
+
         sk = load_user_secure_key(vault, pw)
         for acc in accounts:
             try:
@@ -3072,36 +3032,41 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                 if not ok:
                     skipped += 1
                     continue
-                # Quick TOTP sanity check
-                acc_type = acc.get("account_type", "totp")
-                hotp_ctr = acc.get("hotp_counter", 0)
                 note     = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
-                if acc_type == "totp":
-                    totp_now(secret)
+                totp_now(secret)   # sanity check
+                secret_hash = hashlib.sha256(secret.encode()).hexdigest()
                 ct, s, iv = encrypt(secret, pw, vault)
                 sk_ct = sk_s = sk_iv = None
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
-                if acc["name"] in existing:
+
+                # Duplicate = same name AND same secret
+                name_exists   = acc["name"] in existing_by_name
+                secret_exists = secret_hash in existing_secrets
+
+                if name_exists and secret_exists:
+                    # True duplicate: same name + same secret
                     if mode == "replace":
                         c.execute(
                             "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
-                            "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type=?, hotp_counter=? "
+                            "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0 "
                             "WHERE id=?",
                             (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
-                             note, acc_type, hotp_ctr, existing[acc["name"]]),
+                             note, existing_by_name[acc["name"]]),
                         )
                         replaced += 1
                     else:
                         skipped += 1
                 else:
+                    # Not a true duplicate: add as new entry
                     c.execute(
                         "INSERT INTO totp_accounts "
                         "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
                         "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
-                         sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr),
+                         sk_ct, sk_s, sk_iv, note, "totp", 0),
                     )
+                    existing_secrets.add(secret_hash)
                     imported += 1
             except Exception as e:
                 logger.error(f"Import entry '{acc.get('name','?')}': {e}")
@@ -3268,22 +3233,11 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for i, row in enumerate(matched, 1):
                 try:
                     secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
-                    acc_type = row["account_type"] or "totp"
-                    hotp_ctr = row["hotp_counter"] or 0
                     note     = (row["note"] or "").strip()
-                    code, remain, next_code = generate_code(acc_type, secret, hotp_ctr)
-                    if acc_type == "hotp":
-                        code_fmt  = code
-                        time_line = f"Counter: {hotp_ctr}"
-                    elif acc_type == "steam":
-                        code_fmt  = code
-                        time_line = f"{bar(remain)} {remain}s"
-                    else:
-                        code_fmt  = f"{code[:3]} {code[3:]}"
-                        time_line = f"{bar(remain)} {remain}s"
-                    nf = next_code if acc_type in ("steam", "hotp") else (
-                        f"{next_code[:3]} {next_code[3:]}" if next_code else ""
-                    )
+                    code, remain, next_code = generate_code(secret)
+                    code_fmt  = f"{code[:3]} {code[3:]}"
+                    time_line = f"{bar(remain)} {remain}s"
+                    nf = f"{next_code[:3]} {next_code[3:]}" if next_code else ""
                     name_line = f"*{i}\\. {em(row['name'])}*"
                     if row["issuer"]:
                         name_line += f" \\| _{em(row['issuer'])}_"
@@ -3329,7 +3283,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 c.commit()
             try:
-                code, remain, _ = generate_code("totp", secret)
+                code, remain, _ = generate_code(secret)
             except Exception:
                 code, remain = "------", 30
             await update.message.reply_text(
@@ -3427,24 +3381,11 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for i, row in enumerate(matched, 1):
         try:
             secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
-            acc_type = row["account_type"] or "totp"
-            hotp_ctr = row["hotp_counter"] or 0
             note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(acc_type, secret, hotp_ctr)
-            if acc_type == "hotp":
-                code_fmt  = code
-                time_line = f"Counter: {hotp_ctr}"
-            elif acc_type == "steam":
-                code_fmt  = code
-                time_line = f"{bar(remain)} {remain}s"
-            else:
-                code_fmt  = f"{code[:3]} {code[3:]}"
-                time_line = f"{bar(remain)} {remain}s"
-            if next_code:
-                nf = next_code if acc_type in ("steam", "hotp") else f"{next_code[:3]} {next_code[3:]}"
-                next_line = f"Next code: `{nf}`"
-            else:
-                next_line = ""
+            code, remain, next_code = generate_code(secret)
+            code_fmt  = f"{code[:3]} {code[3:]}"
+            time_line = f"{bar(remain)} {remain}s"
+            next_line = f"Next code: `{next_code[:3]} {next_code[3:]}`" if next_code else ""
             note_line = f"Note: {em(note)}" if note else ""
             name_line = f"*{i}\\. {em(row['name'])}*"
             if row["issuer"]:
@@ -3989,6 +3930,12 @@ async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (uid, new_enabled),
         )
         c.commit()
+    # When enabling, immediately store the current password so backup works from this session
+    if new_enabled == 1:
+        pw    = ctx.user_data.get("password")
+        vault = get_session(uid)
+        if pw and vault:
+            _oab_store_password(uid, vault, pw)
     return await offline_auto_backup_menu(update, ctx)
 
 async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4155,7 +4102,7 @@ async def send_auto_backups(app):
     Job callback: check who needs a weekly or monthly auto-backup and send it.
     Weekly:  Every Saturday, BD time 20:00
     Monthly: First Sunday of month, BD time 18:00
-    Called by job queue every hour (we check time windows inside).
+    Runs every 5 minutes; checks if current BDT time is within the target window.
     """
     try:
         import zoneinfo
@@ -4163,30 +4110,29 @@ async def send_auto_backups(app):
     except Exception:
         now_bd = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
 
-    weekday  = now_bd.weekday()   # Monday=0, Saturday=5, Sunday=6
-    hour     = now_bd.hour
-    minute   = now_bd.minute
-    day      = now_bd.day
+    weekday = now_bd.weekday()   # Monday=0, Saturday=5, Sunday=6
+    hour    = now_bd.hour
+    minute  = now_bd.minute
+    day     = now_bd.day
 
-    # Weekly window: Saturday (weekday=5), 20:00 - 20:59 BDT
-    is_weekly_window  = (weekday == 5 and hour == 20)
-    # Monthly window: first Sunday (weekday=6, day<=7), 18:00 - 18:59 BDT
-    is_monthly_window = (weekday == 6 and day <= 7 and hour == 18)
+    # Weekly window:  Saturday 20:00-20:09 BDT
+    is_weekly_window  = (weekday == 5 and hour == 20 and minute < 10)
+    # Monthly window: first Sunday (day<=7) 18:00-18:09 BDT
+    is_monthly_window = (weekday == 6 and day <= 7 and hour == 18 and minute < 10)
 
     if not is_weekly_window and not is_monthly_window:
-        return  # Nothing to do this hour
+        return
 
     now_ts = int(time.time())
     with get_db() as c:
         rows = c.execute(
-            "SELECT telegram_id, enabled, frequency, last_weekly, last_monthly "
+            "SELECT telegram_id, frequency, last_weekly, last_monthly "
             "FROM auto_backup_settings WHERE enabled=1"
         ).fetchall()
 
     for row in rows:
-        tid      = row["telegram_id"]
-        freq     = row["frequency"]
-        # Find vault_id for this user
+        tid  = row["telegram_id"]
+        freq = row["frequency"]
         with get_db() as c:
             u = c.execute("SELECT vault_id FROM users WHERE telegram_id=?", (tid,)).fetchone()
         if not u:
@@ -4194,13 +4140,11 @@ async def send_auto_backups(app):
         vault_id = u["vault_id"]
 
         if is_weekly_window and freq == "weekly":
-            # Guard: only once per week (avoid re-sending if job runs multiple times in same hour)
             if now_ts - (row["last_weekly"] or 0) < 6 * 24 * 3600:
                 continue
             asyncio.create_task(run_auto_backup_for_user(app.bot, tid, vault_id, "weekly"))
 
         elif is_monthly_window and freq == "monthly":
-            # Guard: only once per month
             if now_ts - (row["last_monthly"] or 0) < 25 * 24 * 3600:
                 continue
             asyncio.create_task(run_auto_backup_for_user(app.bot, tid, vault_id, "monthly"))
@@ -4589,11 +4533,11 @@ def main():
             first=60,
             name="backup_reminder_job",
         )
-        # Auto-backup: runs every hour, checks if it's the right BDT time window
+        # Auto-backup: runs every 5 minutes, checks if it's the right BDT time window
         jq.run_repeating(
             _autobackup_job,
-            interval=3600,
-            first=120,
+            interval=300,
+            first=60,
             name="auto_backup_job",
         )
 
