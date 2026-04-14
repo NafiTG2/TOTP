@@ -3589,10 +3589,13 @@ def _fmt_user_info(u) -> str:
             ra = c.execute(
                 "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
             ).fetchone()
-        # Backup Reminder status
-        reminder_status = "Off"
-        if br and br["enabled"]:
+        # Backup Reminder status — default is ON/Weekly if no row exists
+        if br is None:
+            reminder_status = "On - Weekly (default)"
+        elif br["enabled"]:
             reminder_status = f"On - {br['frequency'].capitalize()}"
+        else:
+            reminder_status = "Off"
         # Offline Auto Backup status
         auto_backup_status = "Off"
         if ab and ab["enabled"]:
@@ -4274,7 +4277,9 @@ async def backup_rem_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     with get_db() as c:
         row = c.execute("SELECT enabled FROM backup_reminders WHERE telegram_id=?", (uid,)).fetchone()
-        new_enabled = 0 if (row and row["enabled"]) else 1
+        # Default is enabled=1 (on). If no row, current state is ON, so toggling means OFF.
+        current = bool(row["enabled"]) if row else True
+        new_enabled = 0 if current else 1
         c.execute(
             "INSERT INTO backup_reminders (telegram_id, enabled) VALUES (?,?) "
             "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
@@ -4302,21 +4307,32 @@ async def backup_rem_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def send_backup_reminders(app):
     """
     Job callback: send backup reminders to users who are due.
-    Called by APScheduler / JobQueue once per day.
+    Called by job queue once per day.
+    Default state: enabled=1, weekly. Users with no row in backup_reminders get weekly reminders.
     """
-    now = int(time.time())
+    now     = int(time.time())
     week_s  = 7  * 24 * 3600
     month_s = 30 * 24 * 3600
+
+    # Get all users; LEFT JOIN with backup_reminders to include users with no preference row
     with get_db() as c:
-        rows = c.execute(
-            "SELECT telegram_id, frequency, last_sent FROM backup_reminders WHERE enabled=1"
-        ).fetchall()
+        rows = c.execute("""
+            SELECT u.telegram_id,
+                   COALESCE(br.frequency, 'weekly')  AS frequency,
+                   COALESCE(br.enabled,  1)           AS enabled,
+                   COALESCE(br.last_sent, 0)          AS last_sent
+            FROM users u
+            LEFT JOIN backup_reminders br ON br.telegram_id = u.telegram_id
+        """).fetchall()
+
     for row in rows:
-        tid      = row["telegram_id"]
+        if not row["enabled"]:
+            continue
         freq     = row["frequency"]
         interval = week_s if freq == BACKUP_REMINDER_WEEKLY else month_s
         if now - row["last_sent"] < interval:
             continue
+        tid = row["telegram_id"]
         try:
             await app.bot.send_message(
                 chat_id=tid,
@@ -4330,7 +4346,9 @@ async def send_backup_reminders(app):
             )
             with get_db() as c:
                 c.execute(
-                    "UPDATE backup_reminders SET last_sent=? WHERE telegram_id=?", (now, tid)
+                    "INSERT INTO backup_reminders (telegram_id, last_sent) VALUES (?,?) "
+                    "ON CONFLICT(telegram_id) DO UPDATE SET last_sent=excluded.last_sent",
+                    (tid, now),
                 )
                 c.commit()
         except Exception as e:
