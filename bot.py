@@ -58,6 +58,13 @@ BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
 BD_TZ = "Asia/Dhaka"       # Bangladesh timezone for admin panel
 
+# ── Rate limit constants ────────────────────────────────────
+TOTP_NAME_MAX_LEN      = 20    # max TOTP account name length
+MAX_DAILY_LOGINS       = 7     # max successful logins per day per telegram_id
+MAX_WEEKLY_SIGNUPS     = 2     # max signups per week per telegram_id
+MAX_LIFETIME_VAULTS    = 5     # max distinct vaults a telegram_id can ever login to
+MAX_TOTP_PER_MINUTE    = 20    # max TOTP accounts added in 1 minute per vault
+
 # ── Bot-wide toggleable settings (stored in memory + DB bot_settings table) ──
 _bot_settings: dict = {
     "maintenance": False,
@@ -107,6 +114,161 @@ def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
     except Exception as e:
         logger.warning(f"_oab_load_password failed for {telegram_id}: {e}")
         return None
+
+# ── Rate Limit Helpers ──────────────────────────────────────
+
+def _today_bucket() -> str:
+    """Return current UTC date string YYYY-MM-DD for daily buckets."""
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+def _week_bucket() -> str:
+    """Return current ISO week string YYYY-WNN for weekly buckets."""
+    d = datetime.datetime.utcnow()
+    return d.strftime("%Y-W%W")
+
+def check_daily_login_limit(telegram_id: int) -> bool:
+    """Returns True if the user has NOT exceeded MAX_DAILY_LOGINS today."""
+    today = _today_bucket()
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
+    if not row or row["day_bucket"] != today:
+        return True   # fresh day or no record
+    return row["count"] < MAX_DAILY_LOGINS
+
+def record_daily_login(telegram_id: int):
+    """Increment today's login counter for a telegram_id."""
+    today = _today_bucket()
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
+        if not row or row["day_bucket"] != today:
+            c.execute(
+                "INSERT INTO daily_login_counts (telegram_id, count, day_bucket) VALUES (?,?,?) "
+                "ON CONFLICT(telegram_id) DO UPDATE SET count=1, day_bucket=excluded.day_bucket",
+                (telegram_id, 1, today),
+            )
+        else:
+            c.execute(
+                "UPDATE daily_login_counts SET count=count+1 WHERE telegram_id=?",
+                (telegram_id,)
+            )
+        c.commit()
+
+def check_weekly_signup_limit(telegram_id: int) -> bool:
+    """Returns True if the user has NOT exceeded MAX_WEEKLY_SIGNUPS this week."""
+    week = _week_bucket()
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
+    if not row or row["week_bucket"] != week:
+        return True
+    return row["count"] < MAX_WEEKLY_SIGNUPS
+
+def record_weekly_signup(telegram_id: int):
+    """Increment this week's signup counter for a telegram_id."""
+    week = _week_bucket()
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
+        if not row or row["week_bucket"] != week:
+            c.execute(
+                "INSERT INTO weekly_signup_counts (telegram_id, count, week_bucket) VALUES (?,?,?) "
+                "ON CONFLICT(telegram_id) DO UPDATE SET count=1, week_bucket=excluded.week_bucket",
+                (telegram_id, 1, week),
+            )
+        else:
+            c.execute(
+                "UPDATE weekly_signup_counts SET count=count+1 WHERE telegram_id=?",
+                (telegram_id,)
+            )
+        c.commit()
+
+def check_vault_login_limit(telegram_id: int, vault_id: str) -> bool:
+    """Returns True if the telegram_id can login to this vault.
+    Allowed if vault already in history OR total distinct vaults < MAX_LIFETIME_VAULTS."""
+    with get_db() as c:
+        # Check if this vault is already known for this telegram_id
+        known = c.execute(
+            "SELECT 1 FROM vault_login_history WHERE telegram_id=? AND vault_id=?",
+            (telegram_id, vault_id)
+        ).fetchone()
+        if known:
+            return True
+        # Count distinct vaults ever logged in from this telegram_id
+        cnt = c.execute(
+            "SELECT COUNT(*) AS n FROM vault_login_history WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()["n"]
+    return cnt < MAX_LIFETIME_VAULTS
+
+def record_vault_login(telegram_id: int, vault_id: str):
+    """Record this (telegram_id, vault_id) pair in history."""
+    with get_db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO vault_login_history (telegram_id, vault_id) VALUES (?,?)",
+            (telegram_id, vault_id),
+        )
+        c.commit()
+
+def check_totp_add_rate(vault_id: str) -> bool:
+    """Returns True if vault has NOT exceeded MAX_TOTP_PER_MINUTE in the last 60 seconds."""
+    now = int(time.time())
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
+            (vault_id,)
+        ).fetchone()
+    if not row or now - row["window_start"] >= 60:
+        return True   # window expired or no record
+    return row["count"] < MAX_TOTP_PER_MINUTE
+
+def record_totp_add(vault_id: str):
+    """Increment the per-minute TOTP add counter for a vault."""
+    now = int(time.time())
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
+            (vault_id,)
+        ).fetchone()
+        if not row or now - row["window_start"] >= 60:
+            # Start fresh window
+            c.execute(
+                "INSERT INTO totp_add_rate (vault_id, count, window_start) VALUES (?,?,?) "
+                "ON CONFLICT(vault_id) DO UPDATE SET count=1, window_start=excluded.window_start",
+                (vault_id, 1, now),
+            )
+        else:
+            c.execute(
+                "UPDATE totp_add_rate SET count=count+1 WHERE vault_id=?",
+                (vault_id,)
+            )
+        c.commit()
+
+def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
+    """If 'Google' already exists, return 'Google 1', 'Google 2', etc."""
+    base = requested_name.strip()[:TOTP_NAME_MAX_LEN]
+    with get_db() as c:
+        existing = {
+            r["name"] for r in c.execute(
+                "SELECT name FROM totp_accounts WHERE vault_id=?", (vault_id,)
+            ).fetchall()
+        }
+    if base not in existing:
+        return base
+    for i in range(1, 1000):
+        candidate = f"{base[:TOTP_NAME_MAX_LEN - len(str(i)) - 1]} {i}"
+        if candidate not in existing:
+            return candidate
+    return base  # fallback (should never happen)
 
 # ── DB ─────────────────────────────────────────────────────
 class _DB:
@@ -227,6 +389,30 @@ def init_db():
             pw_enc       BLOB,
             pw_salt      BLOB,
             pw_iv        BLOB)""")
+
+        # New: daily login counter per telegram_id
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_login_counts (
+            telegram_id  INTEGER PRIMARY KEY,
+            count        INTEGER DEFAULT 0,
+            day_bucket   TEXT    DEFAULT '')""")
+
+        # New: weekly signup counter per telegram_id
+        c.execute("""CREATE TABLE IF NOT EXISTS weekly_signup_counts (
+            telegram_id  INTEGER PRIMARY KEY,
+            count        INTEGER DEFAULT 0,
+            week_bucket  TEXT    DEFAULT '')""")
+
+        # New: lifetime distinct vault logins per telegram_id
+        c.execute("""CREATE TABLE IF NOT EXISTS vault_login_history (
+            telegram_id  INTEGER NOT NULL,
+            vault_id     TEXT    NOT NULL,
+            PRIMARY KEY  (telegram_id, vault_id))""")
+
+        # New: TOTP add rate limiting per vault (1-minute window)
+        c.execute("""CREATE TABLE IF NOT EXISTS totp_add_rate (
+            vault_id     TEXT    PRIMARY KEY,
+            count        INTEGER DEFAULT 0,
+            window_start INTEGER DEFAULT 0)""")
 
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
@@ -553,6 +739,8 @@ def parse_otpauth(uri: str):
         # Only TOTP is supported
         if otp_type != "totp":
             return None
+        # Enforce name length limit (QR names auto-truncated silently)
+        name = name[:TOTP_NAME_MAX_LEN]
         return {"name": name, "issuer": issuer, "secret": c,
                 "account_type": "totp", "hotp_counter": 0}
     except Exception:
@@ -959,8 +1147,28 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+    # Weekly signup limit: max 2 signups per Telegram account per week
+    if not check_weekly_signup_limit(uid):
+        await q.edit_message_text(
+            "⚠️ *Weekly sign-up limit reached\\.* You can create a maximum of "
+            f"*{MAX_WEEKLY_SIGNUPS}* accounts per week from one Telegram account\\.\n\n"
+            "Please try again next week\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
     vid = gen_vault_id(uid)
     ctx.user_data["signup_vid"] = vid
+    await q.edit_message_text(
+        "🆕 *Create Your Account*\n\n"
+        "Your *BV Vault ID* \\(auto\\-generated\\):\n\n"
+        f"`{em(vid)}`\n\n"
+        "📌 *Save this ID\\!* You need it to login from other devices\\.\n\n"
+        "Set a *password* \\(minimum 6 characters\\):",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_cancel(),
+    )
+    return SIGNUP_PASSWORD
     await q.edit_message_text(
         "🆕 *Create Your Account*\n\n"
         "Your *BV Vault ID* \\(auto\\-generated\\):\n\n"
@@ -1042,6 +1250,8 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["vault_id"] = vid
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
+    record_weekly_signup(uid)               # track weekly signup count
+    record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
@@ -1273,6 +1483,31 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Successful login: clear any failed attempt records
     clear_login_failures(vid)
     update_last_seen(uid)
+
+    # Daily login limit: max 7 successful logins per day per telegram_id
+    if not check_daily_login_limit(uid):
+        await update.message.reply_text(
+            f"⚠️ *Daily login limit reached\\.* Maximum *{MAX_DAILY_LOGINS}* logins per day allowed\\.\n\n"
+            "Please try again tomorrow\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Lifetime vault limit: a telegram_id can access at most 5 distinct vaults ever
+    if not check_vault_login_limit(uid, vid):
+        await update.message.reply_text(
+            f"⚠️ *Vault access limit reached\\.* A single Telegram account can access "
+            f"at most *{MAX_LIFETIME_VAULTS}* different vaults lifetime\\.\n\n"
+            "Contact support if you believe this is an error\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Record this login
+    record_daily_login(uid)
+    record_vault_login(uid, vid)
 
     if uid != u["telegram_id"]:
         new_username = update.effective_user.username or str(uid)
@@ -2107,9 +2342,24 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_WAITING
 
 async def _do_save_totp(update, vault, data, pw):
-    acc_type    = "totp"   # TOTP-only
-    hotp_ctr    = 0        # TOTP-only
-    note        = (data.get("note", "") or "")[:NOTE_MAX_LEN]
+    acc_type = "totp"
+    hotp_ctr = 0
+    note     = (data.get("note", "") or "")[:NOTE_MAX_LEN]
+
+    # Per-minute rate limit: max 20 TOTP additions per minute
+    if not check_totp_add_rate(vault):
+        await update.message.reply_text(
+            f"⚠️ *Too many accounts added\\.*\n\n"
+            f"Maximum *{MAX_TOTP_PER_MINUTE}* TOTP accounts can be added per minute\\.\n"
+            "Please wait a moment and try again\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+
+    # Auto-suffix name if duplicate, enforce max 20 chars
+    final_name = _auto_suffix_name(vault, data["name"])
+
     ct, salt, iv = encrypt(data["secret"], pw, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
@@ -2120,21 +2370,28 @@ async def _do_save_totp(update, vault, data, pw):
         c.execute(
             "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
             "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (vault, data["name"], data.get("issuer", ""), ct, salt, iv,
+            (vault, final_name, data.get("issuer", ""), ct, salt, iv,
              sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr),
         )
         c.commit()
-    # Generate code for confirmation message
+
+    record_totp_add(vault)
+
+    # Show different name if it was auto-suffixed
+    display_name = final_name
+    suffix_note  = ""
+    if final_name != data["name"].strip():
+        suffix_note = f"\n_\\(Renamed to avoid duplicate: {em(final_name)}\\)_"
+
     try:
         code, remain, _ = generate_code(data["secret"])
     except Exception:
         code, remain = "------", 30
     issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
-    code_fmt    = code
     time_info   = f"{bar(remain)} {remain}s"
     await update.message.reply_text(
-        f"✅ *{em(data['name'])}* added\\!{issuer_line}\n\n"
-        f"🔢 `{code_fmt}`\n"
+        f"✅ *{em(display_name)}* added\\!{issuer_line}{suffix_note}\n\n"
+        f"🔢 `{code}`\n"
         f"⏱ {time_info}\n\n"
         f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
         parse_mode="MarkdownV2",
@@ -2245,8 +2502,24 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_manual_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     if not name:
-        await update.message.reply_text("⚠️ Name cannot be empty\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "⚠️ Name cannot be empty\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_cancel(),
+        )
+        return ADD_MANUAL_NAME
+    if len(name) > TOTP_NAME_MAX_LEN:
+        await update.message.reply_text(
+            f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters allowed\\.\n\n"
+            "Please enter a shorter name:",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_cancel(),
+        )
         return ADD_MANUAL_NAME
     preloaded = ctx.user_data.pop("pending_secret", None)
     if preloaded:
@@ -3345,10 +3618,32 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── end # search ──────────────────────────────────────────
 
     if ctx.user_data.get("_global_add") and update.message.text:
-        name   = update.message.text.strip()
-        secret = ctx.user_data.pop("pending_secret", None)
+        raw_name = update.message.text.strip()
+        secret   = ctx.user_data.pop("pending_secret", None)
         ctx.user_data.pop("_global_add", None)
-        if name and secret:
+        if raw_name and secret:
+            # Rate limit check
+            if not check_totp_add_rate(vault):
+                await update.message.reply_text(
+                    f"⚠️ *Too many accounts added\\.*\n\n"
+                    f"Maximum *{MAX_TOTP_PER_MINUTE}* TOTP accounts can be added per minute\\.",
+                    parse_mode="MarkdownV2",
+                    reply_markup=kb_main(),
+                )
+                return
+            # Name length check
+            if len(raw_name) > TOTP_NAME_MAX_LEN:
+                await update.message.reply_text(
+                    f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters\\.\n\nPlease try again with a shorter name:",
+                    parse_mode="MarkdownV2",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Cancel", callback_data="global_add_cancel"),
+                    ]]),
+                )
+                ctx.user_data["pending_secret"] = secret
+                ctx.user_data["_global_add"]    = True
+                return
+            name = _auto_suffix_name(vault, raw_name)
             ct, salt, iv = encrypt(secret, pw, vault)
             sk = load_user_secure_key(vault, pw)
             if sk:
@@ -3362,12 +3657,14 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0),
                 )
                 c.commit()
+            record_totp_add(vault)
             try:
                 code, remain, _ = generate_code(secret)
             except Exception:
                 code, remain = "------", 30
+            suffix_note = f"\n_\\(Renamed: {em(name)}\\)_" if name != raw_name else ""
             await update.message.reply_text(
-                f"✅ *{em(name)}* added\\!\n\n"
+                f"✅ *{em(name)}* added\\!{suffix_note}\n\n"
                 f"🔢 `{code}`\n"
                 f"⏱ {bar(remain)} {remain}s\n\n"
                 f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
