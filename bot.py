@@ -1007,17 +1007,42 @@ def kb_main():
     ])
 
 def kb_settings():
+    """Main settings menu — 3 sections + Main Menu."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Change Password",   callback_data="change_pw")],
-        [InlineKeyboardButton("🔓 Reset Password",    callback_data="settings_reset_pw")],
-        [InlineKeyboardButton("🛡 View Secure Key",   callback_data="view_secure_key")],
-        [InlineKeyboardButton("📤 Export Vault",      callback_data="export_vault")],
-        [InlineKeyboardButton("📥 Import Vault",      callback_data="import_vault")],
-        [InlineKeyboardButton("🔔 Backup Reminder",   callback_data="backup_reminder")],
-        [InlineKeyboardButton("💾 Offline Auto Backup", callback_data="offline_auto_backup")],
-        [InlineKeyboardButton("🗑 Delete Account",    callback_data="delete_account")],
-        [InlineKeyboardButton("🚪 Logout",             callback_data="logout")],
+        [InlineKeyboardButton("🔐 Security & Access",  callback_data="settings_security")],
+        [InlineKeyboardButton("💾 Backup & Restore",   callback_data="settings_backup")],
+        [InlineKeyboardButton("⚙️ Account",            callback_data="settings_account")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
+    ])
+
+def kb_settings_security():
+    """Security & Access sub-menu."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Change Password",  callback_data="change_pw")],
+        [InlineKeyboardButton("🔓 Reset Password",   callback_data="settings_reset_pw")],
+        [InlineKeyboardButton("🛡 View Secure Key",  callback_data="view_secure_key")],
+        [InlineKeyboardButton("⬅️ Back",             callback_data="settings")],
+        [InlineKeyboardButton("❌ Cancel",            callback_data="main_menu")],
+    ])
+
+def kb_settings_backup():
+    """Backup & Restore sub-menu."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Export Vault",       callback_data="export_vault")],
+        [InlineKeyboardButton("📥 Import Vault",       callback_data="import_vault")],
+        [InlineKeyboardButton("💾 Offline Auto Backup", callback_data="offline_auto_backup")],
+        [InlineKeyboardButton("🔔 Backup Reminder",    callback_data="backup_reminder")],
+        [InlineKeyboardButton("⬅️ Back",              callback_data="settings")],
+        [InlineKeyboardButton("❌ Cancel",             callback_data="main_menu")],
+    ])
+
+def kb_settings_account():
+    """Account sub-menu."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚪 Logout",         callback_data="logout")],
+        [InlineKeyboardButton("🗑 Delete Account", callback_data="delete_account")],
+        [InlineKeyboardButton("⬅️ Back",          callback_data="settings")],
+        [InlineKeyboardButton("❌ Cancel",         callback_data="main_menu")],
     ])
 
 def kb_cancel():
@@ -2358,9 +2383,42 @@ async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "⚙️ *Settings*\n\nChoose an option:",
+        "⚙️ *Settings*\n\nChoose a section:",
         parse_mode="MarkdownV2",
         reply_markup=kb_settings(),
+    )
+    return TOTP_MENU
+
+async def settings_security_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Security & Access sub-menu."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🔐 *Security \\& Access*\n\nManage your password and secure key\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_settings_security(),
+    )
+    return TOTP_MENU
+
+async def settings_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Backup & Restore sub-menu."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "💾 *Backup \\& Restore*\n\nExport, import, and schedule automatic backups\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_settings_backup(),
+    )
+    return TOTP_MENU
+
+async def settings_account_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Account sub-menu."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⚙️ *Account*\n\nManage your session and account\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_settings_account(),
     )
     return TOTP_MENU
 
@@ -5008,7 +5066,10 @@ def main():
                 CallbackQueryHandler(search_totp_open,      pattern="^search_totp_open$"),
                 CallbackQueryHandler(edit_totp_start,       pattern="^edit_totp$"),
                 CallbackQueryHandler(show_profile,          pattern="^profile$"),
-                CallbackQueryHandler(settings_menu,         pattern="^settings$"),
+                CallbackQueryHandler(settings_menu,           pattern="^settings$"),
+                CallbackQueryHandler(settings_security_menu,  pattern="^settings_security$"),
+                CallbackQueryHandler(settings_backup_menu,    pattern="^settings_backup$"),
+                CallbackQueryHandler(settings_account_menu,   pattern="^settings_account$"),
                 CallbackQueryHandler(change_pw_start,       pattern="^change_pw$"),
                 CallbackQueryHandler(settings_reset_start,  pattern="^settings_reset_pw$"),
                 CallbackQueryHandler(view_secure_key_start, pattern="^view_secure_key$"),
