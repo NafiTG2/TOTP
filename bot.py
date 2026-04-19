@@ -4411,64 +4411,122 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /export <password>
-    Exports the entire DB as an encrypted .bvadmin file to the admin group.
+
+    Export করার সময় কী হয়:
+    - users, totp_accounts সহ সব গুরুত্বপূর্ণ টেবিল dump হয়।
+    - sessions, login_attempts, reset_attempts বাদ দেওয়া হয় কারণ
+      এগুলো import করলে user সমস্যায় পড়ে (stale session + freeze)।
+    - সব data AES-256-GCM দিয়ে encrypt হয়ে .bvadmin ফাইল হিসেবে পাঠানো হয়।
+
+    Import করার পরে user তার নিজের password দিয়ে fresh login করলেই
+    সব কিছু (TOTP, Secure Key, সব) ঠিকঠাক কাজ করবে।
+    ENCRYPTION_KEY একই রাখতে হবে নতুন server-এ।
     """
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
     if not ctx.args:
-        msg = await update.message.reply_text("Usage: /export <encryption_password>")
+        msg = await update.message.reply_text(
+            "Usage: /export <encryption_password>\n\n"
+            "This exports ALL vault data (users, TOTP accounts, secure keys, bot settings).\n"
+            "Sessions and freeze-locks are excluded so users can log in fresh after import."
+        )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
+
     password = ctx.args[0]
-    tables = [
-        "users", "totp_accounts", "sessions", "reset_otps",
-        "reset_attempts", "login_alerts", "share_links",
-        "login_attempts", "backup_reminders", "bot_settings",
+
+    # এই টেবিলগুলো export করা হবে — সব গুরুত্বপূর্ণ data এখানে আছে।
+    # users         : vault_id, telegram_id, password_hash, pw_salt, kdf_type,
+    #                 mk_enc/mk_salt/mk_iv (master key), sk_enc/sk_salt/sk_iv (secure key),
+    #                 sk_verifier, tg_name, tg_username, timezone, account_disabled, last_seen
+    # totp_accounts : সব TOTP entry — secret_enc, salt, iv (master key দিয়ে encrypt),
+    #                 sk_enc/sk_salt/sk_iv (secure key দিয়ে encrypt), name, issuer, note
+    # backup_reminders, auto_backup_settings, bot_settings : user preferences + bot config
+    # reset_otps, login_alerts, share_links : active state (optional, harmless to include)
+    #
+    # EXCLUDED (intentionally):
+    # sessions      : import হলে ctx.user_data["password"] নেই, তাই সব কাজ fail করে
+    # login_attempts: import হলে পুরনো freeze আসে, user login করতে পারে না
+    # reset_attempts: একই কারণে বাদ
+    # rate-limit tables (daily_login_counts, weekly_signup_counts, totp_add_rate,
+    #                    vault_login_history): নতুন server-এ এগুলো fresh হওয়া উচিত
+    EXPORT_TABLES = [
+        "users",
+        "totp_accounts",
+        "reset_otps",
+        "login_alerts",
+        "share_links",
+        "backup_reminders",
+        "bot_settings",
         "auto_backup_settings",
     ]
-    dump = {}
+
+    dump = {"_meta": {"version": 2, "exported_at": datetime.datetime.utcnow().isoformat()}}
+    total_users = 0
+    total_totp  = 0
+
     with get_db() as c:
-        for tbl in tables:
+        for tbl in EXPORT_TABLES:
             try:
                 rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
                 dump[tbl] = [dict(r) for r in rows]
+                if tbl == "users":
+                    total_users = len(dump[tbl])
+                elif tbl == "totp_accounts":
+                    total_totp = len(dump[tbl])
             except Exception as e:
                 logger.warning(f"Admin export table {tbl}: {e}")
+                dump[tbl] = []
+
     plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
     payload = _admin_encrypt(plain, password)
     ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname   = f"bv_admin_export_{ts_str}.bvadmin"
     bio     = BytesIO(payload)
     bio.name = fname
+
     await update.message.reply_document(
         document=bio,
         filename=fname,
         caption=(
-            f"🔒 BV Authenticator -- Full DB Export\n"
-            f"📅 {ts_str}\n"
-            f"🔑 Encrypted with the password you provided.\n\n"
-            f"Use /import to restore."
+            f"🔒 BV Authenticator - Full DB Export\n"
+            f"📅 {ts_str} UTC\n\n"
+            f"👥 Users: {total_users}\n"
+            f"🔑 TOTP accounts: {total_totp}\n\n"
+            f"Includes: users, TOTP data, secure keys, master keys, bot settings\n"
+            f"Excludes: sessions, login freezes, rate limits (intentional)\n\n"
+            f"Use /import to restore.\n"
+            f"After import, users log in fresh with their own password."
         ),
     )
 
-# Admin import state: waiting for the .bvadmin file
-_admin_import_pending: dict = {}   # chat_id → {"password": str}
+
+# ── Admin import state machine ──────────────────────────────
+# chat_id -> {"step": "wait_file" | "wait_password", "payload": bytes}
+_admin_import_pending: dict = {}
+
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/import  -- starts the import process in the admin group."""
+    """/import  -- starts the admin import flow in the admin group."""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
     chat_id = update.effective_chat.id
     _admin_import_pending[chat_id] = {"step": "wait_file"}
     msg = await update.message.reply_text(
-        "📥 Admin Import\n\nSend the .bvadmin backup file now."
+        "📥 Admin Import\n\n"
+        "Send the .bvadmin backup file now.\n\n"
+        "After import:\n"
+        "- All users log in fresh with their own passwords\n"
+        "- TOTP codes, Secure Keys, everything works normally\n"
+        "- Make sure ENCRYPTION_KEY on this server matches the original"
     )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the .bvadmin file in admin group during /import flow."""
+    """Receive the .bvadmin file in the admin group during /import flow."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
@@ -4476,64 +4534,173 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if state.get("step") != "wait_file":
         return
     if not update.message.document:
-        msg = await update.message.reply_text("⚠️ Please send a .bvadmin file.")
+        msg = await update.message.reply_text("Please send a .bvadmin file.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=10))
     bio = BytesIO()
     f   = await update.message.document.get_file()
     await f.download_to_memory(bio)
-    _admin_import_pending[chat_id] = {"step": "wait_password", "payload": bio.getvalue()}
+    raw = bio.getvalue()
+    if len(raw) < 28:
+        msg = await update.message.reply_text("❌ File too small or corrupted. Send again.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        _admin_import_pending.pop(chat_id, None)
+        return
+    _admin_import_pending[chat_id] = {"step": "wait_password", "payload": raw}
     msg = await update.message.reply_text(
-        "🔒 File received. Now send the encryption password."
+        "✅ File received.\n\n"
+        "Now send the encryption password used during export.\n"
+        "(Message will be deleted immediately after processing.)"
     )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    asyncio.create_task(auto_delete_msg(msg, delay=90))
+
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the decryption password for admin import."""
+    """
+    Receive the decryption password, decrypt the backup, and restore all data.
+
+    Import strategy:
+    - users, totp_accounts : INSERT OR REPLACE (vault_id is the unique key)
+    - bot_settings         : INSERT OR REPLACE (key is the unique key)
+    - backup_reminders, auto_backup_settings : INSERT OR REPLACE
+    - reset_otps, login_alerts, share_links  : INSERT OR IGNORE
+    - sessions, login_attempts, reset_attempts, rate-limit tables : SKIPPED entirely
+
+    Skipping sessions is the critical fix:
+    sessions টেবিল import করলে user "Welcome back" দেখে কিন্তু
+    ctx.user_data["password"] RAM-এ নেই, তাই TOTP list, edit, export সব fail করে।
+    Session skip করলে user fresh login করতে বাধ্য হয়, আর login-এ
+    ctx.user_data["password"] set হয়, তখন সব কিছু ঠিকঠাক কাজ করে।
+    """
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
     if state.get("step") != "wait_password":
         return
+
     password = update.message.text.strip()
-    # Delete the password message immediately
+    # Password message সাথে সাথে delete করো
     try:
         await update.message.delete()
     except Exception:
         pass
+
     payload = state.get("payload", b"")
     try:
         plain = _admin_decrypt(payload, password)
         dump  = json.loads(plain.decode())
     except Exception:
-        await ctx.bot.send_message(chat_id=chat_id, text="❌ Wrong password or corrupted file.")
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Wrong password or corrupted file. Start over with /import."
+        )
         _admin_import_pending.pop(chat_id, None)
         return
+
     _admin_import_pending.pop(chat_id, None)
-    tables = list(dump.keys())
+
+    # INSERT OR REPLACE: পুরনো data overwrite করবে, নতুন data add করবে
+    REPLACE_TABLES = {
+        "users", "totp_accounts", "bot_settings",
+        "backup_reminders", "auto_backup_settings",
+    }
+    # INSERT OR IGNORE: existing data রাখো, শুধু নতুন add করো
+    IGNORE_TABLES = {
+        "reset_otps", "login_alerts", "share_links",
+    }
+    # সম্পূর্ণ skip (stale/server-specific data যা import হলে user-কে block করে)
+    SKIP_TABLES = {
+        "sessions",             # critical: ctx.user_data["password"] নেই বলে সব fail করে
+        "login_attempts",       # পুরনো freeze user-কে login করতে দেয় না
+        "reset_attempts",       # পুরনো reset freeze
+        "daily_login_counts",   # rate limit: নতুন server-এ fresh হওয়া উচিত
+        "weekly_signup_counts",
+        "vault_login_history",
+        "totp_add_rate",
+    }
+
+    stats = {"replaced": [], "ignored": [], "skipped": [], "errors": []}
+    total_users = 0
+    total_totp  = 0
+
     with get_db() as c:
         for tbl, rows in dump.items():
+            # _meta block বাদ দাও
+            if tbl == "_meta" or not isinstance(rows, list):
+                continue
+
+            if tbl in SKIP_TABLES:
+                stats["skipped"].append(tbl)
+                continue
+
+            if not rows:
+                continue
+
+            inserted = 0
             for row in rows:
-                if not rows:
+                if not isinstance(row, dict) or not row:
                     continue
-                cols  = ", ".join(row.keys())
-                phs   = ", ".join("?" for _ in row)
+                cols = ", ".join(row.keys())
+                phs  = ", ".join("?" for _ in row)
+                vals = list(row.values())
+
                 try:
-                    c.execute(
-                        f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({phs})",
-                        list(row.values()),
-                    )
+                    if tbl in REPLACE_TABLES:
+                        c.execute(
+                            f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({phs})", vals
+                        )
+                    elif tbl in IGNORE_TABLES:
+                        c.execute(
+                            f"INSERT OR IGNORE INTO {tbl} ({cols}) VALUES ({phs})", vals
+                        )
+                    else:
+                        # অজানা টেবিল: safe হওয়ার জন্য IGNORE strategy
+                        c.execute(
+                            f"INSERT OR IGNORE INTO {tbl} ({cols}) VALUES ({phs})", vals
+                        )
+                    inserted += 1
                 except Exception as e:
-                    logger.warning(f"Admin import row into {tbl}: {e}")
+                    logger.warning(f"Admin import [{tbl}] row error: {e}")
+                    stats["errors"].append(f"{tbl}: {e}")
+
+            strategy = "replaced" if tbl in REPLACE_TABLES else "ignored"
+            stats[strategy].append(f"{tbl}({inserted})")
+            if tbl == "users":
+                total_users = inserted
+            elif tbl == "totp_accounts":
+                total_totp = inserted
+
         c.commit()
-    # Reload bot settings from DB
+
+    # Bot settings memory-তে reload করো
     _load_bot_settings()
-    await ctx.bot.send_message(
-        chat_id=chat_id,
-        text=f"✅ Import complete. Tables restored: {', '.join(tables)}",
+
+    # Import-এর পরে সব active in-memory session clear করো
+    # (কোনো user যদি এই server-এ আগে থেকে logged in থাকে তাকেও fresh login করাতে হবে)
+    _session_pw_cache.clear()
+
+    lines = [
+        "✅ Import complete!\n",
+        f"👥 Users restored: {total_users}",
+        f"🔑 TOTP accounts restored: {total_totp}\n",
+    ]
+    if stats["replaced"]:
+        lines.append(f"Restored: {', '.join(stats['replaced'])}")
+    if stats["ignored"]:
+        lines.append(f"Merged:   {', '.join(stats['ignored'])}")
+    if stats["skipped"]:
+        lines.append(f"Skipped (intentional): {', '.join(stats['skipped'])}")
+    if stats["errors"]:
+        lines.append(f"\n⚠️ Warnings ({len(stats['errors'])}): {'; '.join(stats['errors'][:5])}")
+
+    lines.append(
+        "\nAll users must log in fresh with their own password.\n"
+        "TOTP codes, Secure Keys, and all vault data will work normally after login."
     )
+
+    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
 async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/userall -- send a .txt file listing all users with @username."""
